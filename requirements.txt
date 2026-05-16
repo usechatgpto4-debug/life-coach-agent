@@ -1,0 +1,6 @@
+google-adk
+fastapi
+uvicorn[standard]
+python-dotenv
+python-docx
+openpyxl
