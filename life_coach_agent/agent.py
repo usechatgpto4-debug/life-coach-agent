@@ -1,14 +1,12 @@
-"""
-Life Coach Agent — ADK Agent Definition
-Specializes in: Writing coaching, Self-discovery, Life guidance, MCQ Generation,
-                Document Export (DOCX, PDF, XLSX)
-"""
-
 import os
 import uuid
 import json
 import re
 import logging
+import subprocess
+import sys
+import tempfile
+import traceback
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -19,13 +17,7 @@ from bs4 import BeautifulSoup
 import markdownify
 from google import genai
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import mm
-from reportlab.lib.colors import HexColor
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from fpdf import FPDF
 
 from openpyxl import Workbook
 from openpyxl.styles import Font as XlFont, Alignment, PatternFill, Border, Side
@@ -38,144 +30,49 @@ os.makedirs(EXPORT_DIR, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
-# --- Try to register a Thai-friendly font for PDF ---
-_THAI_FONT_NAME = "Helvetica"  # fallback
-_THAI_FONT_REGISTERED = False
+# We will use fpdf2 for PDF generation, loading fonts directly inside the function
+_FONTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fonts")
+_THAI_FONT_REGULAR = os.path.join(_FONTS_DIR, "Sarabun-Regular.ttf")
+_THAI_FONT_BOLD = os.path.join(_FONTS_DIR, "Sarabun-Bold.ttf")
 
-# Common Thai font paths on macOS
-_THAI_FONT_CANDIDATES = [
-    "/Library/Fonts/Thonburi.ttc",
-    "/System/Library/Fonts/Thonburi.ttc",
-    "/Library/Fonts/TH Sarabun New.ttf",
-    "/System/Library/Fonts/Supplemental/Thonburi.ttf",
-]
+SYSTEM_INSTRUCTION = """คุณคือ "Life Coach AI" — ผู้ช่วยอัจฉริยะที่เชี่ยวชาญด้านการให้คำปรึกษา การเขียน และการสร้างเอกสาร
 
-for _fpath in _THAI_FONT_CANDIDATES:
-    if os.path.exists(_fpath):
-        try:
-            pdfmetrics.registerFont(TTFont("ThaiFont", _fpath, subfontIndex=0))
-            _THAI_FONT_NAME = "ThaiFont"
-            _THAI_FONT_REGISTERED = True
-            break
-        except Exception:
-            continue
+[CRITICAL: LOGIC LENS & TRANSPARENCY]
+ก่อนที่คุณจะตัดสินใจหรือสร้างคำตอบใดๆ ให้คุณ "คิดออกมาดังๆ" เสมอ โดยการเขียนเหตุผลและลำดับความคิดอย่างเป็นขั้นตอน 
+ให้คุณวิเคราะห์คำขอของผู้ใช้ ค้นหาเครื่องมือที่จำเป็นต้องใช้ และอธิบายสิ่งที่คุณกำลังจะทำอย่างชัดเจน
+คุณจะต้องแสดงการคิดอย่างมีตรรกะทีละขั้น (Step-by-step reasoning)
 
+[CORE CAPABILITIES]
+1. การทำความรู้จักผู้ใช้ (Initial Profiling) - สร้างแบบสอบถาม (survey) เพื่อทำความรู้จักผู้ใช้
+2. การให้คำปรึกษา (Life Coaching) - ให้คำแนะนำที่ตรงจุด อบอุ่น เป็นกันเอง และมีเหตุผลรองรับ
+3. การส่งออกเอกสาร (Document Export) - สามารถสร้างไฟล์ docx, pdf, xlsx ให้ผู้ใช้ได้
 
-SYSTEM_INSTRUCTION = """คุณคือ "Life Coach AI" — ผู้ช่วยอัจฉริยะที่เชี่ยวชาญ 3 ด้านหลัก:
-
-## 0. การทำความรู้จักผู้ใช้ (Initial Profiling Survey)
-- **เมื่อเริ่มต้นสนทนาครั้งแรก หรือยังไม่มีข้อมูล:** ให้เริ่มด้วยการทำความรู้จักผู้ใช้ก่อนเสมอ โดยใช้รูปแบบ "survey" JSON format (ดูในหัวข้อ 4.1)
-- **มิติข้อมูลที่ต้องการดึงจากผู้ใช้ (อ้างอิงจากบทวิเคราะห์จิตวิทยา):**
-  1. ค่านิยมและแรงจูงใจ (Values & Motivation)
-  2. สไตล์การทำงานและการใช้ชีวิต (Working Style & Preferences)
-  3. ความท้าทายหรืออุปสรรคที่ฉุดรั้ง (Challenges & Bottlenecks)
-  4. สไตล์การโค้ชชิ่งที่ผู้ใช้ต้องการ (Preferred Coaching Style)
-- ปรับน้ำเสียงให้เป็นกันเอง ไม่คุกคาม และทำให้ผู้ใช้รู้สึกปลอดภัยที่จะแชร์ข้อมูลอย่างเปิดเผย
-
-## 1. สอนเขียนหนังสือ (Writing Coach)
-- ช่วยพัฒนาทักษะการเขียน ตั้งแต่โครงสร้าง ไปจนถึงสำนวน
-- ให้ feedback ที่สร้างสรรค์ วิเคราะห์จุดแข็ง/จุดอ่อนของงานเขียน
-- แนะนำเทคนิคการเขียนแบบมืออาชีพ
-
-## 2. ค้นหาตัวตน (Self-Discovery)
-- ถามคำถามที่กระตุ้นความคิดเพื่อช่วยผู้ใช้ค้นหาตัวเอง
-- วิเคราะห์ค่านิยม จุดแข็ง ความสนใจ
-- เสนอมุมมองใหม่ๆ ในการมองตัวเอง
-
-## 3. แนวทางชีวิต (Life Guidance)
-- ให้คำปรึกษาเรื่องการวางแผนชีวิต
-- ช่วยตั้งเป้าหมายและวางแผนการดำเนินงาน
-- ให้กำลังใจและแรงบันดาลใจ
-
-## 4. รูปแบบการสร้างข้อสอบและแบบสอบถาม (JSON Forms)
-**สำคัญมาก:** เมื่อสร้าง JSON ให้ตอบกลับเฉพาะ JSON ด้านล่างเท่านั้น ห้ามเพิ่มข้อความอื่นก่อนหรือหลัง JSON
-
-### 4.1 สร้างแบบสอบถาม (Survey Generation)
-ใช้สำหรับการทำความรู้จักผู้ใช้ตั้งแต่เริ่มแรก เพื่อลดระยะเวลาการถามทีละข้อ ให้ **สร้างแบบสอบถาม 3-4 ข้อรวดเดียว** ให้ครอบคลุมทุกมิติ (เช่น อาชีพ, เป้าหมาย, ปัญหา) โครงสร้าง JSON:
-
+[PDF GENERATION & PYTHON EXECUTION]
+คุณมีเครื่องมือ `execute_python_code` เพื่อรันโค้ด Python ได้
+- **สำคัญมาก:** เมื่อผู้ใช้ขอไฟล์ PDF หรือต้องการสร้าง PDF ที่มีเนื้อหาภาษาไทย ให้คุณเขียนโค้ด Python โดยใช้ไลบรารี `fpdf` และใช้เครื่องมือ `execute_python_code` เพื่อรันโค้ดและสร้างไฟล์ด้วยตัวเอง (อย่าใช้ create_pdf_document แบบเดิม เพราะอาจมีปัญหาฟอนต์ภาษาไทย)
+- ไฟล์ที่ถูกสร้างต้องถูกบันทึกลงในโฟลเดอร์ `exports` (Path: `./exports/`)
+- ฟอนต์ภาษาไทยอยู่ในโฟลเดอร์ `fonts` (Path: `./fonts/Sarabun-Regular.ttf` และ `./fonts/Sarabun-Bold.ttf`)
+- เมื่อสร้างไฟล์เสร็จเรียบร้อย ให้คุณตอบกลับผู้ใช้ด้วย JSON เพื่อให้ UI แสดงปุ่มดาวน์โหลด โดยมีรูปแบบดังนี้:
 ```json
 {
-  "type": "survey",
-  "title": "ทำความรู้จักกันก่อนเริ่มโค้ชชิ่ง",
-  "questions": [
-    {
-      "id": "q1",
-      "question": "คำถามข้อที่ 1",
-      "options": [
-        {"key": "A", "text": "ตัวเลือก A"},
-        {"key": "B", "text": "ตัวเลือก B"},
-        {"key": "Other", "text": "อื่นๆ (โปรดระบุ)"}
-      ]
-    },
-    {
-      "id": "q2",
-      "question": "คำถามข้อที่ 2",
-      "options": [
-        {"key": "A", "text": "ตัวเลือก A"},
-        {"key": "B", "text": "ตัวเลือก B"},
-        {"key": "Other", "text": "อื่นๆ (โปรดระบุ)"}
-      ]
-    }
-  ]
-}
-```
-**บังคับ:** ทุกคำถามต้องมีตัวเลือก "อื่นๆ (โปรดระบุ)" เสมอ โดยใช้ key เป็น "Other" หรือคีย์ที่เหมาะสม
-
-### 4.2 สร้างข้อสอบ Multiple Choice (MCQ Generation)
-ใช้สำหรับประเมินความรู้หรือทดสอบผู้ใช้ โดยมีคำตอบที่ถูกเพียงข้อเดียว โครงสร้าง JSON:
-
-```json
-{
-  "type": "mcq",
-  "question": "คำถาม",
-  "options": [
-    {"key": "A", "text": "ตัวเลือก A"},
-    {"key": "B", "text": "ตัวเลือก B"},
-    {"key": "C", "text": "ตัวเลือก C"},
-    {"key": "D", "text": "ตัวเลือก D"}
-  ],
-  "correct_answer": "A",
-  "explanation": "คำอธิบายว่าทำไมคำตอบนี้ถูกต้อง"
+  "type": "pdf_download",
+  "filename": "ชื่อไฟล์ที่สร้าง.pdf",
+  "message": "สร้างเอกสาร PDF เสร็จเรียบร้อยแล้วครับ! 📄"
 }
 ```
 
-## 5. สร้างไฟล์เอกสาร (Document Export)
-เมื่อผู้ใช้ขอให้สร้างไฟล์ ให้เลือก tool ที่ตรงกับรูปแบบที่ผู้ใช้ต้องการ:
+[JSON RESPONSE FORMATS]
+เมื่อคุณต้องการสร้างแบบฟอร์ม หรือปุ่มดาวน์โหลด ให้ตอบกลับด้วย JSON โครงสร้างเหล่านี้เท่านั้น (ห้ามพิมพ์ข้อความอื่นต่อท้ายหรือนำหน้า)
+- Survey: `{"type": "survey", "title": "...", "questions": [...]}`
+- MCQ: `{"type": "mcq", "question": "...", "options": [...], "correct_answer": "...", "explanation": "..."}`
+- Word: `{"type": "docx_download", ...}` (ใช้ tool create_docx_document)
+- Excel: `{"type": "xlsx_download", ...}` (ใช้ tool create_xlsx_document)
+- Image: `{"type": "image_generation", ...}` (ใช้ tool generate_image)
 
-### 5.1 ไฟล์ Word (.docx)
-- ใช้ tool `create_docx_document` เมื่อผู้ใช้ขอไฟล์ .docx หรือเอกสาร Word
-- เหมาะกับ: รายงาน, บทความ, คู่มือ, เนื้อหายาว
-
-### 5.2 ไฟล์ PDF (.pdf)
-- ใช้ tool `create_pdf_document` เมื่อผู้ใช้ขอไฟล์ .pdf
-- เหมาะกับ: เอกสารที่ต้องการอ่านอย่างเดียว, รายงาน, สรุป
-
-### 5.3 ไฟล์ Excel (.xlsx)
-- ใช้ tool `create_xlsx_document` เมื่อผู้ใช้ขอไฟล์ .xlsx หรือ Excel หรือตาราง
-- เหมาะกับ: ข้อมูลตาราง, แผน, checklist, การเปรียบเทียบ
-- **สำคัญ:** ให้ส่ง headers และ rows เป็น JSON array
-  - headers: ["หัวข้อ1", "หัวข้อ2", ...]
-  - rows: [["ข้อมูล1", "ข้อมูล2", ...], [...], ...]
-
-### หลักการเลือกรูปแบบ:
-- ถ้าผู้ใช้ระบุชัดเจน (เช่น "สร้าง PDF", "ทำ Excel") → ใช้ตามที่ระบุ
-- ถ้าผู้ใช้พูดว่า "สร้างไฟล์" หรือ "สร้างเอกสาร" โดยไม่ระบุรูปแบบ → ใช้ docx
-- ถ้าเนื้อหาเป็นตาราง/ข้อมูล → แนะนำ xlsx
-- หลังจากเรียก tool สำเร็จ ให้ตอบกลับเฉพาะ JSON ที่ tool ส่งกลับมา ห้ามเพิ่มข้อความอื่น
-
-## 6. เครื่องมืออินเทอร์เน็ตและการสร้างภาพ (Web Tools & Image Generation)
-- **การค้นหาข้อมูลบนเว็บ (Web Search):** หากผู้ใช้สอบถามข้อมูลที่เป็นปัจจุบัน ข้อมูลข่าวสาร หรือข้อมูลที่คุณไม่แน่ใจ ให้ใช้ tool `web_search` เพื่อค้นหาข้อมูลจากอินเทอร์เน็ต
-- **การอ่านเนื้อหาจากลิงก์ (Web Scraping):** หากผู้ใช้ส่ง URL มาให้ หรือต้องการให้สรุปข้อมูลจากเว็บไซต์ใดๆ ให้ใช้ tool `read_url` เพื่อดึงเนื้อหามาอ่านและวิเคราะห์
-- **การสร้างภาพ (Image Generation):** หากผู้ใช้ขอให้สร้างภาพ วาดรูป หรือจินตภาพเป็นรูปภาพ ให้ใช้ tool `generate_image` โดยให้ระบุ prompt อธิบายภาพอย่างละเอียดเป็นภาษาอังกฤษ (คุณสามารถแปลจากภาษาไทยของผู้ใช้ให้เป็น prompt ภาษาอังกฤษที่สละสลวยได้) หลังจากเรียกสำเร็จ ให้ส่ง JSON ที่ได้รับกลับไปให้ผู้ใช้
-
-## แนวทางการสื่อสาร
-- ใช้ภาษาไทยเป็นหลัก แต่ถ้าผู้ใช้พูดภาษาอังกฤษ ให้ตอบเป็นภาษาอังกฤษ
-- พูดเป็นกันเอง อบอุ่น แต่ให้ข้อมูลที่มีคุณภาพ
-- ถามคำถาม follow-up เพื่อเข้าใจผู้ใช้มากขึ้น
-- ให้ตัวอย่างประกอบเมื่อเป็นไปได้
-- **สำคัญ:** เมื่อผู้ใช้ขอสร้างไฟล์หรือสร้างภาพ ให้เรียกใช้ tool ที่เหมาะสมทุกครั้ง
+[LANGUAGE & TONE]
+- ภาษาหลักคือภาษาไทย ให้พูดจาเป็นกันเอง อบอุ่น แต่มีความเป็นมืออาชีพ (ใช้คำว่า "ครับ/ค่ะ")
+- หากผู้ใช้พิมพ์ภาษาอื่น ให้ตอบกลับด้วยภาษานั้นๆ
 """
-
 
 # --- Helper: parse markdown-ish content into lines ---
 def _parse_content_lines(content: str):
@@ -225,7 +122,7 @@ def create_docx_document(title: str, content: str) -> dict:
 
     Args:
         title: The document title (e.g., "คู่มือการสร้างหนังสือ", "แผนพัฒนาตนเอง")
-        content: The full document content. Use '\\n' for line breaks and '## ' prefix for section headings.
+        content: The full document content. Use '\n' for line breaks and '## ' prefix for section headings.
 
     Returns:
         dict: A JSON object with type "docx_download" containing the file_id and filename for download.
@@ -272,110 +169,6 @@ def create_docx_document(title: str, content: str) -> dict:
         "filename": filename,
         "title": title,
         "message": f"สร้างเอกสาร Word '{title}' เรียบร้อยแล้วครับ! คลิกปุ่มด้านล่างเพื่อดาวน์โหลด 📄"
-    }
-
-    return {"status": "success", "result": json.dumps(result, ensure_ascii=False)}
-
-
-def create_pdf_document(title: str, content: str) -> dict:
-    """Create a .pdf document file that the user can download.
-
-    Use this tool whenever the user asks to create a PDF file.
-
-    Args:
-        title: The document title (e.g., "สรุปแนวทางการเขียน", "รายงานการค้นหาตัวตน")
-        content: The full document content. Use '\\n' for line breaks and '## ' prefix for section headings.
-
-    Returns:
-        dict: A JSON object with type "pdf_download" containing the file_id and filename for download.
-    """
-    file_id = str(uuid.uuid4())
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
-    filename = f"{safe_title}_{file_id[:8]}.pdf"
-    filepath = os.path.join(EXPORT_DIR, filename)
-
-    doc = SimpleDocTemplate(
-        filepath,
-        pagesize=A4,
-        leftMargin=25 * mm,
-        rightMargin=25 * mm,
-        topMargin=20 * mm,
-        bottomMargin=20 * mm,
-    )
-
-    # --- Styles ---
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Title'],
-        fontName=_THAI_FONT_NAME,
-        fontSize=22,
-        spaceAfter=12,
-        textColor=HexColor("#1a1a2e"),
-        alignment=1,  # center
-    )
-    heading2_style = ParagraphStyle(
-        'CustomH2',
-        parent=styles['Heading2'],
-        fontName=_THAI_FONT_NAME,
-        fontSize=16,
-        spaceBefore=14,
-        spaceAfter=6,
-        textColor=HexColor("#6c3ce0"),
-    )
-    heading3_style = ParagraphStyle(
-        'CustomH3',
-        parent=styles['Heading3'],
-        fontName=_THAI_FONT_NAME,
-        fontSize=13,
-        spaceBefore=10,
-        spaceAfter=4,
-        textColor=HexColor("#4a4a6a"),
-    )
-    body_style = ParagraphStyle(
-        'CustomBody',
-        parent=styles['Normal'],
-        fontName=_THAI_FONT_NAME,
-        fontSize=11,
-        leading=16,
-        spaceAfter=4,
-    )
-    bullet_style = ParagraphStyle(
-        'CustomBullet',
-        parent=body_style,
-        leftIndent=20,
-        bulletIndent=8,
-        spaceAfter=3,
-    )
-
-    # --- Build PDF elements ---
-    elements = []
-    elements.append(Paragraph(title, title_style))
-    elements.append(Spacer(1, 10))
-
-    for line_type, text in _parse_content_lines(content):
-        if line_type == "blank":
-            elements.append(Spacer(1, 6))
-        elif line_type == "h2":
-            elements.append(Paragraph(text, heading2_style))
-        elif line_type == "h3":
-            elements.append(Paragraph(text, heading3_style))
-        elif line_type == "bullet":
-            elements.append(Paragraph(f"• {text}", bullet_style))
-        elif line_type == "numbered":
-            elements.append(Paragraph(f"   {text}", bullet_style))
-        else:
-            elements.append(Paragraph(text, body_style))
-
-    doc.build(elements)
-
-    result = {
-        "type": "pdf_download",
-        "file_id": file_id,
-        "filename": filename,
-        "title": title,
-        "message": f"สร้างไฟล์ PDF '{title}' เรียบร้อยแล้วครับ! คลิกปุ่มด้านล่างเพื่อดาวน์โหลด 📕"
     }
 
     return {"status": "success", "result": json.dumps(result, ensure_ascii=False)}
@@ -586,10 +379,56 @@ def generate_image(prompt: str) -> dict:
         return {"status": "error", "message": "ไม่สามารถสร้างภาพได้ในขณะนี้ กรุณาลองใหม่"}
 
 
+def execute_python_code(code: str) -> dict:
+    """Execute Python code and return the output.
+    
+    This is useful for generating custom files like PDF using fpdf, data analysis, 
+    or any task that requires executing dynamic Python scripts.
+    
+    Args:
+        code: The Python code to execute.
+        
+    Returns:
+        dict: A JSON object containing the execution status and output or error.
+    """
+    try:
+        # Create a temporary file to hold the code
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
+            temp_file.write(code)
+            temp_file_path = temp_file.name
+            
+        # Execute the code
+        result = subprocess.run(
+            [sys.executable, temp_file_path],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            cwd=os.path.dirname(os.path.dirname(__file__)) # Execute from the project root so ./exports and ./fonts paths work
+        )
+        
+        # Clean up
+        try:
+            os.remove(temp_file_path)
+        except:
+            pass
+            
+        if result.returncode == 0:
+            return {"status": "success", "output": result.stdout}
+        else:
+            return {"status": "error", "error": result.stderr, "output": result.stdout}
+            
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": "Execution timed out after 30 seconds."}
+    except Exception as e:
+        logger.error("execute_python_code failed: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+
 root_agent = Agent(
     name="life_coach_agent",
     model="gemini-3.1-pro-preview",
     description="AI Life Coach that helps with writing, self-discovery, life guidance, web searching, URL reading, image generation, and creates downloadable documents (DOCX, PDF, XLSX).",
     instruction=SYSTEM_INSTRUCTION,
-    tools=[generate_mcq, create_docx_document, create_pdf_document, create_xlsx_document, web_search, read_url, generate_image],
+    tools=[generate_mcq, create_docx_document, create_xlsx_document, web_search, read_url, generate_image, execute_python_code],
 )

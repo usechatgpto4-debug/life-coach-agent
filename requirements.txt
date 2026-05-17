@@ -15,3 +15,5 @@ markdownify
 google-genai
 aiosqlite
 greenlet
+
+fpdf2

@@ -443,23 +443,128 @@ function typewriterEffect(bubbleEl, text) {
     setTimeout(tick, 150);
 }
 
-// --- Typing Indicator ---
-function showTypingIndicator() {
+// --- Activity Timeline ---
+function showActivityTimeline() {
     const el = document.createElement('div');
-    el.className = 'typing-indicator';
-    el.id = 'typingIndicator';
+    el.className = 'message agent activity-timeline-wrapper';
+    el.id = 'activityTimeline';
     el.innerHTML = `
         <div class="message-avatar" style="background: var(--gradient-accent); color: white; box-shadow: var(--shadow-glow);">✦</div>
-        <div class="typing-dots"><span></span><span></span><span></span></div>
+        <div class="message-content">
+            <div class="activity-timeline">
+                <div class="activity-timeline-header">
+                    <span class="activity-pulse-dot"></span>
+                    <span class="activity-title">กำลังประมวลผล...</span>
+                </div>
+                <div class="activity-steps" id="activitySteps"></div>
+            </div>
+        </div>
     `;
     chatMessages.appendChild(el);
     scrollToBottom();
 }
 
-function hideTypingIndicator() {
-    const el = document.getElementById('typingIndicator');
-    if (el) el.remove();
+function addActivityStep(text) {
+    const stepsContainer = document.getElementById('activitySteps');
+    if (!stepsContainer) return;
+
+    // Mark previous active step as completed
+    const prevActive = stepsContainer.querySelector('.activity-step.active');
+    if (prevActive) {
+        prevActive.classList.remove('active');
+        prevActive.classList.add('completed');
+    }
+
+    const step = document.createElement('div');
+    step.className = 'activity-step active';
+    step.setAttribute('data-tool', '');
+    step.innerHTML = `<span class="step-text">${escapeHtml(text)}</span>`;
+    stepsContainer.appendChild(step);
+    scrollToBottom();
 }
+
+function addToolCode(toolName, code) {
+    const stepsContainer = document.getElementById('activitySteps');
+    if (!stepsContainer) return;
+
+    // Find the last step (it should be the tool step we just added)
+    const lastStep = stepsContainer.querySelector('.activity-step:last-child');
+    if (!lastStep) return;
+
+    // Create collapsible code block
+    const codeWrapper = document.createElement('div');
+    codeWrapper.className = 'tool-code-wrapper';
+    codeWrapper.innerHTML = `
+        <button class="tool-code-toggle" onclick="this.parentElement.classList.toggle('expanded')">
+            <svg class="toggle-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+            <span>ดู Code ที่ Agent เรียกใช้</span>
+        </button>
+        <div class="tool-code-content">
+            <pre class="tool-code-block">${escapeHtml(code)}</pre>
+        </div>
+    `;
+    lastStep.appendChild(codeWrapper);
+    scrollToBottom();
+}
+
+function addThinkingLog(text) {
+    const stepsContainer = document.getElementById('activitySteps');
+    if (!stepsContainer) return;
+
+    let logViewer = stepsContainer.querySelector('.thinking-log-viewer:last-child');
+    let contentDiv = null;
+    
+    if (!logViewer || logViewer.classList.contains('closed-log')) {
+        logViewer = document.createElement('div');
+        logViewer.className = 'thinking-log-viewer expanded';
+        logViewer.innerHTML = `
+            <div class="thinking-log-header" onclick="this.parentElement.classList.toggle('expanded')">
+                <svg class="chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+                <span>Agent Thinking...</span>
+            </div>
+            <div class="thinking-log-content"></div>
+        `;
+        stepsContainer.appendChild(logViewer);
+        contentDiv = logViewer.querySelector('.thinking-log-content');
+    } else {
+        contentDiv = logViewer.querySelector('.thinking-log-content');
+    }
+
+    contentDiv.textContent += text;
+    scrollToBottom();
+}
+
+function addToolResult(toolName, status) {
+    const stepsContainer = document.getElementById('activitySteps');
+    if (!stepsContainer) return;
+
+    const logViewer = stepsContainer.querySelector('.thinking-log-viewer.expanded');
+    if (logViewer) {
+        logViewer.classList.remove('expanded');
+        logViewer.classList.add('closed-log');
+    }
+
+    const step = document.createElement('div');
+    step.className = `tool-execution-status ${status === 'running' ? 'active' : ''}`;
+    step.innerHTML = `
+        <i><svg class="tool-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></i>
+        <span>Tool ${status}: <strong>${escapeHtml(toolName)}</strong></span>
+    `;
+    stepsContainer.appendChild(step);
+    scrollToBottom();
+}
+
+function removeActivityTimeline() {
+    const el = document.getElementById('activityTimeline');
+    if (el) {
+        el.style.animation = 'fadeOut 0.3s ease forwards';
+        setTimeout(() => el.remove(), 300);
+    }
+}
+
+// Legacy fallback wrappers
+function showTypingIndicator() { showActivityTimeline(); }
+function hideTypingIndicator() { removeActivityTimeline(); }
 
 // --- Send Message ---
 async function sendMessage(text, isHidden = false) {
@@ -469,7 +574,6 @@ async function sendMessage(text, isHidden = false) {
     }
 
     if (!isHidden) {
-        // Show user message with file indicator
         const displayText = pendingFiles.length > 0
             ? `📎 ${pendingFiles.map(f => f.name).join(', ')}${text.trim() ? '\n' + text : ''}`
             : text;
@@ -480,7 +584,7 @@ async function sendMessage(text, isHidden = false) {
     updateSendButton();
 
     setLoading(true);
-    showTypingIndicator();
+    showActivityTimeline();
 
     try {
         // Upload files and collect results
@@ -511,32 +615,138 @@ async function sendMessage(text, isHidden = false) {
             ? 'กรุณาดูและวิเคราะห์ภาพที่แนบมา'
             : 'กรุณาอ่านและวิเคราะห์ไฟล์ที่แนบมา';
 
-        const response = await api.post('/api/chat', {
+        // --- SSE Streaming ---
+        const sseBody = {
             session_id: currentSessionId,
             message: text || defaultMsg,
             file_context: fileContext,
             image_refs: imageRefs,
+        };
+
+        const response = await fetch('/api/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(sseBody),
         });
 
-        hideTypingIndicator();
-        appendMessage('agent', response.reply, response.msg_type);
+        if (!response.ok) {
+            throw new Error(`API error: ${response.status}`);
+        }
 
-        if (response.msg_type === 'mcq' || response.msg_type === 'survey') {
-            try {
-                const mcqData = JSON.parse(response.reply);
-                setTimeout(() => openMcqModal(mcqData), 400);
-            } catch {
-                // Not valid JSON
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finalReply = '';
+        let finalMsgType = 'text';
+        const toolCodes = []; // Collect tool calls for persistent display
+
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop(); // keep incomplete line in buffer
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                const jsonStr = line.slice(6).trim();
+                if (!jsonStr) continue;
+
+                try {
+                    const event = JSON.parse(jsonStr);
+
+                    if (event.type === 'step') {
+                        addActivityStep(event.text);
+                    } else if (event.type === 'thinking') {
+                        addThinkingLog(event.text);
+                    } else if (event.type === 'tool_result') {
+                        addToolResult(event.tool, event.status);
+                    } else if (event.type === 'tool_code') {
+                        addToolCode(event.tool, event.code);
+                        toolCodes.push({ tool: event.tool, code: event.code });
+                    } else if (event.type === 'final') {
+                        finalReply = event.text;
+                        finalMsgType = event.msg_type || 'text';
+                    } else if (event.type === 'error') {
+                        removeActivityTimeline();
+                        appendMessage('agent', `❌ ${event.text}`, 'text');
+                        return;
+                    } else if (event.type === 'done') {
+                        // Stream complete
+                    }
+                } catch (e) {
+                    // skip malformed JSON
+                }
+            }
+        }
+
+        // Remove timeline and show final response
+        removeActivityTimeline();
+        if (finalReply) {
+            appendMessage('agent', finalReply, finalMsgType);
+
+            // Append persistent Execution Log if tools were used
+            if (toolCodes.length > 0) {
+                appendExecutionLog(toolCodes);
+            }
+
+            if (finalMsgType === 'mcq' || finalMsgType === 'survey') {
+                try {
+                    const mcqData = JSON.parse(finalReply);
+                    setTimeout(() => openMcqModal(mcqData), 400);
+                } catch {
+                    // Not valid JSON
+                }
             }
         }
 
         await loadSessions();
     } catch (err) {
-        hideTypingIndicator();
+        removeActivityTimeline();
         appendMessage('agent', `❌ เกิดข้อผิดพลาด: ${err.message}`, 'text');
     } finally {
         setLoading(false);
     }
+}
+
+/**
+ * Render a persistent Execution Log card in chat.
+ * Shows all tool calls with their arguments in collapsible code blocks.
+ */
+function appendExecutionLog(toolCodes) {
+    const container = document.createElement('div');
+    container.className = 'message agent execution-log-message';
+    
+    const codeItems = toolCodes.map((tc, i) => {
+        const id = `exec-code-${Date.now()}-${i}`;
+        return `
+            <div class="exec-log-item" id="item-${id}">
+                <button class="exec-log-toggle" onclick="document.getElementById('item-${id}').classList.toggle('expanded')">
+                    <svg class="toggle-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+                    <span class="exec-log-tool-name">${escapeHtml(tc.tool)}</span>
+                </button>
+                <div class="exec-log-code">
+                    <pre>${escapeHtml(tc.code)}</pre>
+                </div>
+            </div>`;
+    }).join('');
+
+    container.innerHTML = `
+        <div class="message-avatar" style="background: var(--bg-tertiary); border: 1px solid var(--border-hover); color: var(--text-tertiary); font-size: 0.8rem;">⚙</div>
+        <div class="message-content">
+            <div class="exec-log-card">
+                <div class="exec-log-header">
+                    <span class="exec-log-icon">🔧</span>
+                    <span class="exec-log-title">Execution Log</span>
+                    <span class="exec-log-count">${toolCodes.length} tool${toolCodes.length > 1 ? 's' : ''} used</span>
+                </div>
+                <div class="exec-log-items">${codeItems}</div>
+            </div>
+        </div>
+    `;
+    chatMessages.appendChild(container);
+    scrollToBottom();
 }
 
 // --- MCQ & Survey Modal ---

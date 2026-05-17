@@ -211,9 +211,86 @@ async def api_get_profile_summary():
         return {"summary": f"<p style='color: var(--error-color);'>เกิดข้อผิดพลาดในการวิเคราะห์ข้อมูล: {str(e)}</p>"}
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def api_chat(body: ChatRequest):
-    """Send a message and get an agent response."""
+# --- Tool Label Mapping (Thai) ---
+TOOL_LABELS = {
+    "web_search": "🔍 กำลังค้นหาข้อมูลจากอินเทอร์เน็ต...",
+    "read_url": "📄 กำลังอ่านเนื้อหาจากเว็บไซต์...",
+    "generate_image": "🎨 กำลังสร้างภาพ...",
+    "create_pdf_document": "📕 กำลังสร้างไฟล์ PDF...",
+    "create_docx_document": "📄 กำลังสร้างเอกสาร Word...",
+    "create_xlsx_document": "📊 กำลังสร้างไฟล์ Excel...",
+    "generate_mcq": "📝 กำลังสร้างคำถาม...",
+}
+
+
+def _classify_reply(agent_reply: str) -> tuple[str, str]:
+    """Classify an agent reply into (msg_type, cleaned_reply)."""
+    msg_type = "text"
+    stripped = agent_reply.strip()
+
+    clean = stripped
+    if clean.startswith("```json"):
+        clean = clean[7:]
+    elif clean.startswith("```"):
+        clean = clean[3:]
+    if clean.endswith("```"):
+        clean = clean[:-3]
+    clean = clean.strip()
+
+    json_match = re.search(
+        r'\{[^{}]*"type"\s*:\s*"(?:mcq|survey|docx_download|pdf_download|xlsx_download|image_generation)"[^{}]*\}',
+        clean, re.DOTALL,
+    )
+    if not json_match and (stripped.startswith("{") or stripped.startswith("```")):
+        json_match_text = clean
+    else:
+        json_match_text = json_match.group(0) if json_match else clean
+
+    if stripped.startswith("{") or stripped.startswith("```") or json_match:
+        try:
+            parsed = json.loads(json_match_text)
+            if isinstance(parsed, dict) and parsed.get("type") in ("mcq", "survey"):
+                msg_type = parsed.get("type")
+                agent_reply = json_match_text
+            elif isinstance(parsed, dict) and parsed.get("type") in (
+                "docx_download", "pdf_download", "xlsx_download", "image_generation",
+            ):
+                msg_type = "file"
+                agent_reply = json_match_text
+        except json.JSONDecodeError:
+            pass
+
+    return msg_type, agent_reply
+
+
+def _build_user_content(body: ChatRequest, agent_input: str):
+    """Build multimodal Content from request body."""
+    parts = [Part(text=agent_input)]
+
+    if body.image_refs:
+        for img_ref in body.image_refs:
+            img_path = os.path.join(UPLOAD_DIR, img_ref)
+            if os.path.exists(img_path):
+                ext = os.path.splitext(img_ref)[1].lower()
+                mime_map = {
+                    ".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }
+                mime = mime_map.get(ext, "image/png")
+                with open(img_path, "rb") as img_f:
+                    img_bytes = img_f.read()
+                parts.append(Part(inline_data=Blob(mime_type=mime, data=img_bytes)))
+                try:
+                    os.remove(img_path)
+                except OSError:
+                    pass
+
+    return Content(parts=parts)
+
+
+async def _prepare_agent_input(body: ChatRequest) -> str:
+    """Prepare agent input text with profile and file context."""
     session_id = body.session_id
     user_message = body.message
 
@@ -221,9 +298,8 @@ async def api_chat(body: ChatRequest):
         answer = user_message.replace("[ตอบแบบสอบถาม]", "").strip()
         db.append_user_profile(answer)
 
-    # If file context is attached, prepend it to the message for the agent
     agent_input = user_message
-    
+
     user_profile = db.get_user_profile()
     if user_profile:
         profile_text = ", ".join(user_profile)
@@ -238,54 +314,157 @@ async def api_chat(body: ChatRequest):
 
 ข้อความจากผู้ใช้: {agent_input}"""
 
-    # Save the user-visible message (without file content bloat)
+    # Save user-visible message
     display_msg = user_message
     if body.file_context:
         display_msg = f"📎 {user_message}" if user_message.strip() else "📎 ส่งไฟล์แนบ"
     db.add_message(session_id, "user", display_msg, "text")
 
+    # Ensure ADK session exists
     existing = await session_service.get_session(
-        app_name=APP_NAME,
-        user_id=USER_ID,
-        session_id=session_id,
+        app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
     )
     if not existing:
         await session_service.create_session(
-            app_name=APP_NAME,
-            user_id=USER_ID,
-            session_id=session_id,
+            app_name=APP_NAME, user_id=USER_ID, session_id=session_id,
         )
 
+    return agent_input
+
+
+def _sse(data: dict) -> str:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+# --- SSE Streaming Chat Endpoint ---
+@app.post("/api/chat/stream")
+async def api_chat_stream(body: ChatRequest):
+    """Send a message and stream agent activity + response via SSE."""
+    agent_input = await _prepare_agent_input(body)
+    user_content = _build_user_content(body, agent_input)
+    session_id = body.session_id
+
+    async def event_generator():
+        agent_reply = ""
+        call_counter = 0
+
+        # Initial thinking step
+        yield _sse({"type": "step", "text": "🤔 กำลังคิดวิเคราะห์..."})
+
+        try:
+            async for event in runner.run_async(
+                user_id=USER_ID,
+                session_id=session_id,
+                new_message=user_content,
+            ):
+                # --- Tool Call Request ---
+                if event.get_function_calls():
+                    for fc in event.get_function_calls():
+                        call_counter += 1
+                        tool_name = fc.name
+                        label = TOOL_LABELS.get(tool_name, f"⚙️ กำลังใช้เครื่องมือ {tool_name}...")
+                        yield _sse({"type": "step", "text": label})
+
+                        # Send tool code/args for inline display
+                        try:
+                            args_dict = dict(fc.args) if fc.args else {}
+                            truncated_args = {}
+                            for k, v in args_dict.items():
+                                if isinstance(v, str) and len(v) > 800:
+                                    truncated_args[k] = v[:800] + f"\n... (truncated, {len(v)} chars total)"
+                                elif isinstance(v, list) and len(v) > 10:
+                                    truncated_args[k] = v[:10]
+                                else:
+                                    truncated_args[k] = v
+                            code_display = json.dumps(
+                                {"function": tool_name, "arguments": truncated_args},
+                                ensure_ascii=False, indent=2,
+                            )
+                            yield _sse({
+                                "type": "tool_code",
+                                "tool": tool_name,
+                                "code": code_display,
+                                "call_id": call_counter,
+                            })
+                        except Exception:
+                            pass
+
+                # --- Tool Response ---
+                elif event.get_function_responses():
+                    for fr in event.get_function_responses():
+                        # Extract a preview of what the tool returned
+                        result_preview = ""
+                        try:
+                            resp = fr.response
+                            if isinstance(resp, dict):
+                                result_preview = json.dumps(resp, ensure_ascii=False, indent=2)
+                            else:
+                                result_preview = str(resp) if resp else ""
+                            # Truncate long results
+                            if len(result_preview) > 1000:
+                                result_preview = result_preview[:1000] + f"\n... (truncated, {len(result_preview)} chars)"
+                        except Exception:
+                            result_preview = "(ไม่สามารถแสดงผลลัพธ์ได้)"
+
+                        tool_name = fr.name if hasattr(fr, "name") else "tool"
+                        yield _sse({
+                            "type": "tool_result",
+                            "tool": tool_name,
+                            "preview": result_preview,
+                        })
+
+                # --- Intermediate text (agent thinking) ---
+                elif not event.is_final_response() and event.content and event.content.parts:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            # This is the agent's intermediate reasoning
+                            yield _sse({
+                                "type": "thinking",
+                                "text": part.text,
+                            })
+
+                # --- Final Response ---
+                elif event.is_final_response():
+                    if event.content and event.content.parts:
+                        agent_reply = event.content.parts[0].text or ""
+
+            # Classify and save
+            msg_type, agent_reply = _classify_reply(agent_reply)
+            db.add_message(session_id, "agent", agent_reply, msg_type)
+
+            # Auto-title on first message
+            messages = db.get_session_messages(session_id)
+            user_msgs = [m for m in messages if m["role"] == "user"]
+            if len(user_msgs) == 1:
+                title = body.message[:40] + ("..." if len(body.message) > 40 else "")
+                db.update_session_title(session_id, title)
+
+            # Send final response
+            yield _sse({"type": "final", "text": agent_reply, "msg_type": msg_type})
+
+        except Exception as e:
+            logger.error("SSE stream error: %s", e, exc_info=True)
+            yield _sse({"type": "error", "text": "เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง"})
+
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# --- Original Chat Endpoint (fallback) ---
+@app.post("/api/chat", response_model=ChatResponse)
+async def api_chat(body: ChatRequest):
+    """Send a message and get an agent response (non-streaming fallback)."""
+    agent_input = await _prepare_agent_input(body)
+    user_content = _build_user_content(body, agent_input)
+    session_id = body.session_id
+
     agent_reply = ""
-
-    # Build multimodal content parts
-    parts = [Part(text=agent_input)]
-
-    # Attach image parts if provided
-    if body.image_refs:
-        for img_ref in body.image_refs:
-            img_path = os.path.join(UPLOAD_DIR, img_ref)
-            if os.path.exists(img_path):
-                ext = os.path.splitext(img_ref)[1].lower()
-                mime_map = {
-                    ".png": "image/png",
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".gif": "image/gif",
-                    ".webp": "image/webp",
-                }
-                mime = mime_map.get(ext, "image/png")
-                with open(img_path, "rb") as img_f:
-                    img_bytes = img_f.read()
-                parts.append(Part(inline_data=Blob(mime_type=mime, data=img_bytes)))
-                # Clean up after reading
-                try:
-                    os.remove(img_path)
-                except OSError:
-                    pass
-
-    user_content = Content(parts=parts)
-
     async for event in runner.run_async(
         user_id=USER_ID,
         session_id=session_id,
@@ -295,44 +474,13 @@ async def api_chat(body: ChatRequest):
             if event.content and event.content.parts:
                 agent_reply = event.content.parts[0].text or ""
 
-    msg_type = "text"
-    stripped = agent_reply.strip()
-
-    # Try to extract JSON from the response
-    clean = stripped
-    if clean.startswith("```json"):
-        clean = clean[7:]
-    elif clean.startswith("```"):
-        clean = clean[3:]
-    if clean.endswith("```"):
-        clean = clean[:-3]
-    clean = clean.strip()
-
-    # Also try to find JSON embedded in text
-    json_match = re.search(r'\{[^{}]*"type"\s*:\s*"(?:mcq|survey|docx_download|pdf_download|xlsx_download|image_generation)"[^{}]*\}', clean, re.DOTALL)
-    if not json_match and (stripped.startswith("{") or stripped.startswith("```")):
-        json_match_text = clean
-    else:
-        json_match_text = json_match.group(0) if json_match else clean
-
-    if stripped.startswith("{") or stripped.startswith("```") or json_match:
-        try:
-            parsed = json.loads(json_match_text)
-            if isinstance(parsed, dict) and parsed.get("type") in ("mcq", "survey"):
-                msg_type = parsed.get("type")
-                agent_reply = json_match_text
-            elif isinstance(parsed, dict) and parsed.get("type") in ("docx_download", "pdf_download", "xlsx_download", "image_generation"):
-                msg_type = "file"
-                agent_reply = json_match_text
-        except json.JSONDecodeError:
-            pass
-
+    msg_type, agent_reply = _classify_reply(agent_reply)
     db.add_message(session_id, "agent", agent_reply, msg_type)
 
     messages = db.get_session_messages(session_id)
     user_msgs = [m for m in messages if m["role"] == "user"]
     if len(user_msgs) == 1:
-        title = user_message[:40] + ("..." if len(user_message) > 40 else "")
+        title = body.message[:40] + ("..." if len(body.message) > 40 else "")
         db.update_session_title(session_id, title)
 
     return ChatResponse(

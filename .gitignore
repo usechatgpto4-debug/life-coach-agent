@@ -35,3 +35,7 @@ Thumbs.db
 
 # Gemini / Agent
 .gemini/
+
+# Logs & Tests
+server.log
+test_pdf.py
