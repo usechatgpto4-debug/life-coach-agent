@@ -7,20 +7,34 @@ import os
 import uuid
 import json
 import asyncio
+import re
+import csv
+import io
+import base64
+import logging
+import pathlib
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
+import PyPDF2
+from docx import Document as DocxDocument
+from openpyxl import load_workbook
+from google import genai
 from google.adk.agents import Agent
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
-from google.genai.types import Content, Part
+from google.adk.sessions import DatabaseSessionService
+from google.genai.types import Content, Part, Blob
 
 import db
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 # --- Load environment ---
 load_dotenv(os.path.join(os.path.dirname(__file__), "life_coach_agent", ".env"))
@@ -31,7 +45,11 @@ from life_coach_agent.agent import root_agent
 APP_NAME = "life_coach_app"
 USER_ID = "default_user"
 
-session_service = InMemorySessionService()
+# --- Persistent Session Service (survives server restarts) ---
+_SESSION_DB_PATH = os.path.join(os.path.dirname(__file__), "agent_sessions.db")
+session_service = DatabaseSessionService(db_url=f"sqlite+aiosqlite:///{_SESSION_DB_PATH}")
+logger.info("Using DatabaseSessionService (persistent) at %s", _SESSION_DB_PATH)
+
 runner = Runner(
     agent=root_agent,
     app_name=APP_NAME,
@@ -49,10 +67,23 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Life Coach Agent MVP", lifespan=lifespan)
 
 
+# --- Global Error Handler ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch unhandled exceptions and return a safe JSON error."""
+    logger.error("Unhandled error on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง"}
+    )
+
+
 # --- Pydantic Models ---
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    file_context: str = ""  # extracted text from uploaded file(s)
+    image_refs: list = []   # list of saved image filenames for multimodal
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -84,6 +115,13 @@ async def api_list_sessions():
     return db.list_sessions()
 
 
+@app.delete("/api/sessions/all")
+async def api_delete_all_sessions():
+    """Delete all chat sessions."""
+    db.delete_all_sessions()
+    return {"status": "cleared"}
+
+
 @app.delete("/api/sessions/{session_id}")
 async def api_delete_session(session_id: str):
     """Delete a chat session."""
@@ -91,10 +129,86 @@ async def api_delete_session(session_id: str):
     return {"status": "deleted"}
 
 
+@app.get("/api/export")
+async def api_export_data():
+    """Export all user data as JSON."""
+    sessions = db.list_sessions()
+    for s in sessions:
+        s['messages'] = db.get_session_messages(s['id'])
+    profile = db.get_user_profile()
+    
+    return {
+        "profile": profile,
+        "sessions": sessions
+    }
+
+
 @app.get("/api/sessions/{session_id}/messages")
 async def api_get_messages(session_id: str):
     """Get all messages for a session."""
-    return db.get_messages(session_id)
+    return db.get_session_messages(session_id)
+
+@app.get("/api/profile")
+async def api_get_profile():
+    """Get user profile."""
+    profile = db.get_user_profile()
+    return {"profile": profile}
+
+@app.delete("/api/profile")
+async def api_delete_profile():
+    """Clear user profile."""
+    db.clear_user_profile()
+    if hasattr(app, "profile_summary_cache"):
+        app.profile_summary_cache = None
+    return {"status": "cleared"}
+
+@app.get("/api/profile_summary")
+async def api_get_profile_summary():
+    """Get an AI-generated summary of the user's profile."""
+    profile = db.get_user_profile()
+    if not profile:
+        return {"summary": "<p style='color: var(--text-muted); text-align: center;'>ยังไม่มีข้อมูลส่วนตัว<br>กรุณาเริ่มแชทเพื่อตอบแบบสอบถามเบื้องต้น</p>"}
+    
+    profile_text = "\n".join(profile)
+    
+    # Simple cache to avoid re-generating for the same profile
+    if hasattr(app, "profile_summary_cache") and app.profile_summary_cache and app.profile_summary_cache.get("text") == profile_text:
+        return {"summary": app.profile_summary_cache["summary"]}
+
+    try:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            api_key = os.environ.get("GOOGLE_API_KEY", "")
+            
+        if not api_key:
+            return {"summary": "<p style='color: var(--error-color);'>API Key is missing.</p>"}
+        
+        client = genai.Client(api_key=api_key)
+        prompt = f"""
+จากข้อมูลแบบสอบถามผู้ใช้ต่อไปนี้:
+{profile_text}
+
+ให้เขียนวิเคราะห์สั้นๆ เป็นภาษาไทย (แบบเป็นกันเอง เหมือนโค้ชชีวิต) โดยสรุปเป็น bullet points ตามหัวข้อต่อไปนี้:
+- 👤 บุคลิก/ลักษณะนิสัยเบื้องต้น
+- 💼 อาชีพการงาน
+- 💰 รายได้ (ถ้าไม่มีข้อมูล ให้ประเมินคร่าวๆ จากอาชีพ หรือระบุว่ายังไม่มีข้อมูลและควรสอบถามเพิ่ม)
+- 🎯 เป้าหมายและความท้าทาย
+
+จัดรูปแบบข้อความแบบ HTML โดยใช้ tag <ul> <li> และ <strong> (ไม่ต้องมี tag <html> หรือ <body> ไม่ต้องมี markdown ```html) 
+เน้นการวิเคราะห์เชิงลึกที่ช่วยให้ผู้ใช้อยากเริ่มพูดคุยกับโค้ช
+"""
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        html_summary = response.text.replace("```html", "").replace("```", "").strip()
+        
+        # Save to cache
+        app.profile_summary_cache = {"text": profile_text, "summary": html_summary}
+        
+        return {"summary": html_summary}
+    except Exception as e:
+        return {"summary": f"<p style='color: var(--error-color);'>เกิดข้อผิดพลาดในการวิเคราะห์ข้อมูล: {str(e)}</p>"}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -103,7 +217,32 @@ async def api_chat(body: ChatRequest):
     session_id = body.session_id
     user_message = body.message
 
-    db.add_message(session_id, "user", user_message, "text")
+    if user_message.startswith("[ตอบแบบสอบถาม]"):
+        answer = user_message.replace("[ตอบแบบสอบถาม]", "").strip()
+        db.append_user_profile(answer)
+
+    # If file context is attached, prepend it to the message for the agent
+    agent_input = user_message
+    
+    user_profile = db.get_user_profile()
+    if user_profile:
+        profile_text = ", ".join(user_profile)
+        agent_input = f"[ข้อมูลอ้างอิงผู้ใช้ (จดจำไว้ตลอดการสนทนา): {profile_text}]\n\n{agent_input}"
+
+    if body.file_context:
+        agent_input = f"""[ผู้ใช้แนบไฟล์มาด้วย — เนื้อหาของไฟล์อยู่ด้านล่าง]
+
+--- เนื้อหาไฟล์ที่แนบ ---
+{body.file_context}
+--- จบเนื้อหาไฟล์ ---
+
+ข้อความจากผู้ใช้: {agent_input}"""
+
+    # Save the user-visible message (without file content bloat)
+    display_msg = user_message
+    if body.file_context:
+        display_msg = f"📎 {user_message}" if user_message.strip() else "📎 ส่งไฟล์แนบ"
+    db.add_message(session_id, "user", display_msg, "text")
 
     existing = await session_service.get_session(
         app_name=APP_NAME,
@@ -118,7 +257,34 @@ async def api_chat(body: ChatRequest):
         )
 
     agent_reply = ""
-    user_content = Content(parts=[Part(text=user_message)])
+
+    # Build multimodal content parts
+    parts = [Part(text=agent_input)]
+
+    # Attach image parts if provided
+    if body.image_refs:
+        for img_ref in body.image_refs:
+            img_path = os.path.join(UPLOAD_DIR, img_ref)
+            if os.path.exists(img_path):
+                ext = os.path.splitext(img_ref)[1].lower()
+                mime_map = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                }
+                mime = mime_map.get(ext, "image/png")
+                with open(img_path, "rb") as img_f:
+                    img_bytes = img_f.read()
+                parts.append(Part(inline_data=Blob(mime_type=mime, data=img_bytes)))
+                # Clean up after reading
+                try:
+                    os.remove(img_path)
+                except OSError:
+                    pass
+
+    user_content = Content(parts=parts)
 
     async for event in runner.run_async(
         user_id=USER_ID,
@@ -132,27 +298,38 @@ async def api_chat(body: ChatRequest):
     msg_type = "text"
     stripped = agent_reply.strip()
 
-    if stripped.startswith("{") or stripped.startswith("```"):
-        clean = stripped
-        if clean.startswith("```json"):
-            clean = clean[7:]
-        elif clean.startswith("```"):
-            clean = clean[3:]
-        if clean.endswith("```"):
-            clean = clean[:-3]
-        clean = clean.strip()
+    # Try to extract JSON from the response
+    clean = stripped
+    if clean.startswith("```json"):
+        clean = clean[7:]
+    elif clean.startswith("```"):
+        clean = clean[3:]
+    if clean.endswith("```"):
+        clean = clean[:-3]
+    clean = clean.strip()
 
+    # Also try to find JSON embedded in text
+    json_match = re.search(r'\{[^{}]*"type"\s*:\s*"(?:mcq|survey|docx_download|pdf_download|xlsx_download|image_generation)"[^{}]*\}', clean, re.DOTALL)
+    if not json_match and (stripped.startswith("{") or stripped.startswith("```")):
+        json_match_text = clean
+    else:
+        json_match_text = json_match.group(0) if json_match else clean
+
+    if stripped.startswith("{") or stripped.startswith("```") or json_match:
         try:
-            parsed = json.loads(clean)
-            if isinstance(parsed, dict) and parsed.get("type") == "mcq":
-                msg_type = "mcq"
-                agent_reply = clean
+            parsed = json.loads(json_match_text)
+            if isinstance(parsed, dict) and parsed.get("type") in ("mcq", "survey"):
+                msg_type = parsed.get("type")
+                agent_reply = json_match_text
+            elif isinstance(parsed, dict) and parsed.get("type") in ("docx_download", "pdf_download", "xlsx_download", "image_generation"):
+                msg_type = "file"
+                agent_reply = json_match_text
         except json.JSONDecodeError:
             pass
 
     db.add_message(session_id, "agent", agent_reply, msg_type)
 
-    messages = db.get_messages(session_id)
+    messages = db.get_session_messages(session_id)
     user_msgs = [m for m in messages if m["role"] == "user"]
     if len(user_msgs) == 1:
         title = user_message[:40] + ("..." if len(user_message) > 40 else "")
@@ -165,6 +342,173 @@ async def api_chat(body: ChatRequest):
     )
 
 
+# --- File Upload & Text Extraction ---
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def extract_text_from_file(filepath: str, filename: str) -> str:
+    """Extract text content from a file based on its extension."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        if ext == ".txt":
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+
+        elif ext == ".csv":
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                reader = csv.reader(f)
+                lines = []
+                for row in reader:
+                    lines.append(" | ".join(row))
+                return "\n".join(lines)
+
+        elif ext == ".pdf":
+            text_parts = []
+            with open(filepath, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                for page in reader.pages[:50]:  # limit to 50 pages
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+            return "\n\n".join(text_parts)
+
+        elif ext == ".docx":
+            doc = DocxDocument(filepath)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            return "\n".join(paragraphs)
+
+        elif ext == ".xlsx":
+            wb = load_workbook(filepath, read_only=True, data_only=True)
+            sheets_text = []
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                sheet_lines = [f"[Sheet: {sheet_name}]"]
+                for row in ws.iter_rows(values_only=True):
+                    row_text = " | ".join(str(cell) if cell is not None else "" for cell in row)
+                    if row_text.strip(" |"):
+                        sheet_lines.append(row_text)
+                sheets_text.append("\n".join(sheet_lines))
+            wb.close()
+            return "\n\n".join(sheets_text)
+
+        else:
+            return f"(ไม่รองรับไฟล์ประเภท {ext})"
+
+    except Exception as e:
+        return f"(เกิดข้อผิดพลาดในการอ่านไฟล์: {str(e)})"
+
+
+# Image file extensions
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+DOC_EXTS = {".txt", ".pdf", ".docx", ".xlsx", ".csv"}
+ALL_ALLOWED = DOC_EXTS | IMAGE_EXTS
+
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload a file — extract text for documents, or save reference for images."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALL_ALLOWED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ไฟล์ประเภท {ext} ไม่รองรับ กรุณาใช้: {', '.join(sorted(ALL_ALLOWED))}"
+        )
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="ไฟล์ใหญ่เกิน 10 MB")
+
+    file_id = str(uuid.uuid4())[:8]
+    safe_name = f"{file_id}_{file.filename}"
+    filepath = os.path.join(UPLOAD_DIR, safe_name)
+
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    # --- Image files: keep on disk, return reference for multimodal ---
+    if ext in IMAGE_EXTS:
+        return {
+            "filename": file.filename,
+            "type": "image",
+            "image_ref": safe_name,
+            "size": len(content),
+        }
+
+    # --- Document files: extract text and clean up ---
+    extracted = extract_text_from_file(filepath, file.filename or "file.txt")
+
+    max_chars = 8000
+    truncated = False
+    if len(extracted) > max_chars:
+        extracted = extracted[:max_chars]
+        truncated = True
+
+    try:
+        os.remove(filepath)
+    except OSError:
+        pass
+
+    return {
+        "filename": file.filename,
+        "type": "document",
+        "extracted_text": extracted,
+        "char_count": len(extracted),
+        "truncated": truncated,
+    }
+
+
+# --- Serve Uploaded Image Preview ---
+IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+
+
+@app.get("/api/uploads/{filename}")
+async def serve_upload_preview(filename: str):
+    """Serve an uploaded image for preview in the chat."""
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    # --- Path traversal protection ---
+    if not pathlib.Path(filepath).resolve().is_relative_to(pathlib.Path(UPLOAD_DIR).resolve()):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = os.path.splitext(filename)[1].lower()
+    media = IMAGE_MIME.get(ext, "application/octet-stream")
+    return FileResponse(path=filepath, media_type=media)
+
+exports_dir = os.path.join(os.path.dirname(__file__), "exports")
+os.makedirs(exports_dir, exist_ok=True)
+
+# MIME type mapping for file downloads
+MIME_TYPES = {
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pdf": "application/pdf",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+@app.get("/api/download/{filename}")
+async def download_file(filename: str):
+    """Download a generated file (docx, pdf, xlsx)."""
+    filepath = os.path.join(exports_dir, filename)
+    # --- Path traversal protection ---
+    if not pathlib.Path(filepath).resolve().is_relative_to(pathlib.Path(exports_dir).resolve()):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = os.path.splitext(filename)[1].lower()
+    media_type = MIME_TYPES.get(ext, "application/octet-stream")
+    return FileResponse(
+        path=filepath,
+        filename=filename,
+        media_type=media_type,
+    )
+
+
 # --- Serve Frontend ---
 static_dir = os.path.join(os.path.dirname(__file__), "static")
 
@@ -173,3 +517,7 @@ async def serve_index():
     return FileResponse(os.path.join(static_dir, "index.html"))
 
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+images_dir = os.path.join(static_dir, "outputs")
+os.makedirs(images_dir, exist_ok=True)
+app.mount("/images", StaticFiles(directory=images_dir), name="images")
