@@ -39,10 +39,23 @@ def init_db():
             session_id  TEXT NOT NULL,
             role        TEXT NOT NULL CHECK(role IN ('user', 'agent')),
             content     TEXT NOT NULL,
-            msg_type    TEXT NOT NULL DEFAULT 'text' CHECK(msg_type IN ('text', 'mcq', 'file')),
+            msg_type    TEXT NOT NULL DEFAULT 'text' CHECK(msg_type IN ('text', 'mcq', 'file', 'survey')),
             timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id     TEXT PRIMARY KEY,
+            profile_data TEXT NOT NULL DEFAULT '[]'
+        );
+    """)
+
+    # --- Performance index ---
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_messages_session
+        ON messages(session_id, timestamp);
     """)
 
     conn.commit()
@@ -88,6 +101,12 @@ def delete_session(session_id: str):
     conn.commit()
     conn.close()
 
+def delete_all_sessions():
+    conn = get_connection()
+    conn.execute("DELETE FROM sessions")
+    conn.commit()
+    conn.close()
+
 
 # --- Message CRUD ---
 
@@ -103,11 +122,38 @@ def add_message(session_id: str, role: str, content: str, msg_type: str = "text"
     return dict(row)
 
 
-def get_messages(session_id: str) -> list[dict]:
+def get_session_messages(session_id: str) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
-        (session_id,),
+        (session_id,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# --- User Profile ---
+
+def get_user_profile(user_id: str = "default_user") -> list:
+    conn = get_connection()
+    row = conn.execute("SELECT profile_data FROM user_profiles WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return json.loads(row["profile_data"])
+    return []
+
+def append_user_profile(answer: str, user_id: str = "default_user"):
+    profile = get_user_profile(user_id)
+    profile.append(answer)
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO user_profiles (user_id, profile_data) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET profile_data=excluded.profile_data",
+        (user_id, json.dumps(profile, ensure_ascii=False))
+    )
+    conn.commit()
+    conn.close()
+
+def clear_user_profile(user_id: str = "default_user"):
+    conn = get_connection()
+    conn.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()

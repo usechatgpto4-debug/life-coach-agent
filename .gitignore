@@ -15,7 +15,13 @@ env/
 
 # Database
 database.db
+agent_sessions.db
 *.db
+
+# Generated files
+exports/
+uploads/
+static/outputs/
 
 # IDE
 .vscode/

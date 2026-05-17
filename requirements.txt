@@ -4,3 +4,14 @@ uvicorn[standard]
 python-dotenv
 python-docx
 openpyxl
+reportlab
+PyPDF2
+python-multipart
+
+duckduckgo-search
+requests
+beautifulsoup4
+markdownify
+google-genai
+aiosqlite
+greenlet
