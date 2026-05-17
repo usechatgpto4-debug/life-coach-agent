@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+Thai:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
     <div class="app-container">
@@ -31,6 +31,13 @@
                     <span class="footer-dot"></span>
                     <span>MVP — Single User</span>
                 </div>
+                <button class="btn-settings" id="btnOpenSettings" title="การตั้งค่าระบบ" style="margin-top: 12px; display: flex; align-items: center; gap: 8px; width: 100%; justify-content: center; background: rgba(124, 91, 245, 0.1); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 8px; padding: 8px; cursor: pointer; transition: all 0.2s;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+                    </svg>
+                    <span style="font-size: 0.9rem; font-weight: 500;">ตั้งค่าระบบ (Settings)</span>
+                </button>
             </div>
         </aside>
 
@@ -53,6 +60,9 @@
                             <path d="M14 11v6"/>
                             <path d="M9 6V4h6v2"/>
                         </svg>
+                    </button>
+                    <button class="btn-icon btn-user-profile" id="btnUserProfile" title="ดูข้อมูลโปรไฟล์" style="font-size: 1.2rem; margin-left: 8px;">
+                        👤
                     </button>
                 </div>
             </header>
@@ -88,7 +98,14 @@
             </div>
 
             <div class="chat-input-area">
+                <div id="filePreview" class="file-preview-area" style="display:none;"></div>
                 <div class="input-container">
+                    <button class="btn-attach" id="btnAttach" title="แนบไฟล์">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                        </svg>
+                    </button>
+                    <input type="file" id="fileInput" accept=".txt,.pdf,.docx,.xlsx,.csv,.png,.jpg,.jpeg,.gif,.webp" style="display:none;" multiple />
                     <textarea id="messageInput" placeholder="พิมพ์ข้อความ..." rows="1" autofocus></textarea>
                     <button class="btn-send" id="btnSend" title="Send" disabled>
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -97,7 +114,7 @@
                         </svg>
                     </button>
                 </div>
-                <p class="input-hint">กด Enter เพื่อส่ง • Shift+Enter ขึ้นบรรทัดใหม่</p>
+                <p class="input-hint">กด Enter เพื่อส่ง • Shift+Enter ขึ้นบรรทัดใหม่ • 📎 แนบไฟล์ & รูปภาพ</p>
             </div>
         </main>
     </div>
@@ -109,8 +126,10 @@
                 <button class="modal-close" id="btnCloseModal">&times;</button>
             </div>
             <div class="modal-body">
-                <p class="mcq-question" id="mcqQuestion"></p>
-                <div class="mcq-options" id="mcqOptions"></div>
+                <h4 id="surveyTitle" style="margin-top:0; margin-bottom: 16px; display:none;"></h4>
+                <div id="surveyQuestionsContainer">
+                    <!-- Dynamic questions will be injected here -->
+                </div>
                 <div class="mcq-result" id="mcqResult" style="display: none;">
                     <div class="result-icon" id="resultIcon"></div>
                     <p class="result-text" id="resultText"></p>
@@ -118,8 +137,76 @@
                 </div>
             </div>
             <div class="modal-footer">
+                <button class="btn-modal-action" id="btnNextQuestion" style="display: none;" disabled>ถัดไป</button>
                 <button class="btn-modal-action" id="btnSubmitAnswer" disabled>ส่งคำตอบ</button>
                 <button class="btn-modal-secondary" id="btnCloseResult" style="display: none;">ปิด</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="profileModal">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-header">
+                <h3 class="modal-title">👤 ข้อมูลส่วนตัวของคุณ</h3>
+                <button class="modal-close" id="btnCloseProfileModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p style="margin-bottom: 16px; color: var(--text-muted);"><strong>AI เข้าใจคุณเบื้องต้นว่า:</strong></p>
+                <div id="profileSummaryContainer" class="profile-summary" style="background: var(--bg-card); padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); font-size: 0.95rem; line-height: 1.6;">
+                    <!-- Dynamic summary here -->
+                </div>
+                <p style="font-size: 0.85em; color: var(--text-muted); margin-top: 20px; text-align: center;">
+                    ต้องการเปลี่ยนข้อมูล? กรุณากดปุ่ม "ล้างข้อมูลส่วนตัว" ที่เมนูด้านซ้ายล่าง
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="modal-overlay" id="settingsModal">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-header">
+                <h3 class="modal-title">⚙️ ตั้งค่าระบบ (Settings)</h3>
+                <button class="modal-close" id="btnCloseSettingsModal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-group" style="margin-bottom: 24px;">
+                    <h4 style="margin-bottom: 12px; color: var(--text-secondary); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.5px;">ข้อมูลและความเป็นส่วนตัว</h4>
+                    
+                    <div class="setting-item" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-subtle);">
+                        <div>
+                            <div style="font-weight: 500; color: var(--text-primary);">ดาวน์โหลดข้อมูล (Export)</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">ดาวน์โหลดประวัติแชทและข้อมูลส่วนตัวเป็นไฟล์ JSON</div>
+                        </div>
+                        <button id="btnExportData" style="background: rgba(124, 91, 245, 0.1); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 6px 12px; cursor: pointer; transition: all 0.2s;">Export</button>
+                    </div>
+
+                    <div class="setting-item" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--border-subtle);">
+                        <div>
+                            <div style="font-weight: 500; color: var(--text-primary);">ลบประวัติแชททั้งหมด</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">ลบข้อความสนทนาและแชททั้งหมด (กู้คืนไม่ได้)</div>
+                        </div>
+                        <button id="btnClearAllChats" style="background: rgba(255, 59, 48, 0.1); color: #ff3b30; border: 1px solid rgba(255, 59, 48, 0.2); border-radius: 6px; padding: 6px 12px; cursor: pointer; transition: all 0.2s;">ลบแชท</button>
+                    </div>
+
+                    <div class="setting-item" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0;">
+                        <div>
+                            <div style="font-weight: 500; color: var(--text-primary);">ล้างข้อมูลส่วนตัว</div>
+                            <div style="font-size: 0.85rem; color: var(--text-muted); margin-top: 4px;">เริ่มทำแบบสอบถามวิเคราะห์ตัวตนใหม่ทั้งหมด</div>
+                        </div>
+                        <button id="btnClearProfileData" style="background: rgba(255, 59, 48, 0.1); color: #ff3b30; border: 1px solid rgba(255, 59, 48, 0.2); border-radius: 6px; padding: 6px 12px; cursor: pointer; transition: all 0.2s;">ล้างข้อมูล</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="modal-overlay" id="confirmModal" style="z-index: 9999;">
+        <div class="modal-content" style="max-width: 400px; text-align: center; padding: 24px;">
+            <div class="modal-body">
+                <p id="confirmMessage" style="margin-bottom: 24px; color: var(--text-primary); font-size: 1.05rem; line-height: 1.5;"></p>
+                <div style="display: flex; gap: 12px; justify-content: center;">
+                    <button id="btnConfirmCancel" style="flex: 1; padding: 10px 16px; border-radius: 8px; border: 1px solid var(--border-subtle); background: var(--bg-card); color: var(--text-primary); cursor: pointer; transition: all 0.2s; font-weight: 500;">ยกเลิก</button>
+                    <button id="btnConfirmOk" style="flex: 1; padding: 10px 16px; border-radius: 8px; border: none; background: #ff3b30; color: white; cursor: pointer; transition: all 0.2s; font-weight: 500;">ยืนยัน</button>
+                </div>
             </div>
         </div>
     </div>
@@ -130,6 +217,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=3"></script>
 </body>
 </html>
