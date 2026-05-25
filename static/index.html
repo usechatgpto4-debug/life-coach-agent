@@ -144,6 +144,27 @@
         </div>
     </div>
 
+    <!-- Confirm Action Mini Modal -->
+    <div class="confirm-modal-overlay" id="actionConfirmModal">
+        <div class="confirm-modal">
+            <div class="confirm-modal-icon" id="confirmIcon">📖</div>
+            <h3 class="confirm-modal-title" id="confirmTitle">ยืนยันการสร้างหนังสือ</h3>
+            <div class="confirm-modal-details" id="confirmDetails">
+                <!-- Dynamic details injected here -->
+            </div>
+            <div class="confirm-modal-actions">
+                <button class="confirm-btn confirm-btn-cancel" id="btnActionCancel">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    ยกเลิก
+                </button>
+                <button class="confirm-btn confirm-btn-proceed" id="btnConfirmProceed">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+                    ดำเนินการเลย
+                </button>
+            </div>
+        </div>
+    </div>
+
     <div class="modal-overlay" id="profileModal">
         <div class="modal-content" style="max-width: 500px;">
             <div class="modal-header">
@@ -217,6 +238,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=5"></script>
+    <script src="/static/app.js?v=6"></script>
 </body>
 </html>

@@ -1,19 +1,18 @@
 google-adk
+google-genai
 fastapi
 uvicorn[standard]
 python-dotenv
 python-docx
 openpyxl
-reportlab
 PyPDF2
 python-multipart
+weasyprint
+markdown
 
 duckduckgo-search
 requests
 beautifulsoup4
 markdownify
-google-genai
 aiosqlite
 greenlet
-
-fpdf2

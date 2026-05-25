@@ -266,6 +266,65 @@ function appendMessage(role, content, msgType = 'text', animate = true) {
             return;
         }
 
+        if (fileData.type === 'confirm_action') {
+            showNovelConfirmModal(fileData);
+            msgEl.innerHTML = buildTextMessage(avatarContent, fileData.summary || 'กรุณายืนยันการดำเนินการ', role);
+            chatMessages.appendChild(msgEl);
+            scrollToBottom();
+            return;
+        }
+
+        if (fileData.type === 'novel_in_progress') {
+            const jobId = fileData.job_id;
+            const cardId = `novel-progress-${jobId}`;
+            msgEl.innerHTML = `
+                <div class="message-avatar">${avatarContent}</div>
+                <div class="message-content">
+                    <div id="${cardId}" class="novel-progress-card" style="background: linear-gradient(135deg, rgba(139,92,246,0.15), rgba(59,130,246,0.1)); border: 1px solid rgba(139,92,246,0.3); border-radius: 16px; padding: 20px; min-width: 300px;">
+                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                            <span style="font-size: 1.5em;">📖</span>
+                            <div>
+                                <div data-novel-title style="font-weight: 600; color: var(--text-primary);">${escapeHtml(fileData.title || 'กำลังสร้างนิยาย...')}</div>
+                                <div style="font-size: 0.85em; color: var(--text-muted);">${fileData.chapters || '?'} บท</div>
+                            </div>
+                        </div>
+                        <div class="novel-step" style="font-size: 0.9em; color: var(--text-muted); margin-bottom: 8px;">⏳ เริ่มต้นประมวลผล...</div>
+                        <div style="background: rgba(255,255,255,0.1); border-radius: 8px; height: 6px; overflow: hidden;">
+                            <div class="novel-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, #8b5cf6, #3b82f6); border-radius: 8px; transition: width 0.5s ease;"></div>
+                        </div>
+                        <div class="novel-pct" style="text-align: right; font-size: 0.8em; color: var(--text-muted); margin-top: 4px;">0%</div>
+                    </div>
+                </div>
+            `;
+            chatMessages.appendChild(msgEl);
+            scrollToBottom();
+            startNovelPolling(jobId, cardId);
+            return;
+        }
+
+        if (fileData.type === 'novel_download') {
+            msgEl.innerHTML = `
+                <div class="message-avatar">${avatarContent}</div>
+                <div class="message-content">
+                    <div class="file-download-card" style="--file-accent: #8b5cf6">
+                        <div class="file-card-icon">📖</div>
+                        <div class="file-card-info">
+                            <div class="file-card-label">Novel Export</div>
+                            <div class="file-card-title">${escapeHtml(fileData.title || 'นิยาย')}</div>
+                            <div class="file-card-message">${escapeHtml(fileData.message || 'Export เรียบร้อย!')}</div>
+                            <div style="display: flex; gap: 8px; margin-top: 10px;">
+                                ${fileData.docx ? `<a href="/api/download/${encodeURIComponent(fileData.docx)}" class="file-download-btn" style="background: linear-gradient(135deg, #3b82f6, #3b82f6dd); font-size: 0.85em; padding: 6px 14px;" download>📄 DOCX</a>` : ''}
+                                ${fileData.pdf ? `<a href="/api/download/${encodeURIComponent(fileData.pdf)}" class="file-download-btn" style="background: linear-gradient(135deg, #ef4444, #ef4444dd); font-size: 0.85em; padding: 6px 14px;" download>📕 PDF</a>` : ''}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            chatMessages.appendChild(msgEl);
+            scrollToBottom();
+            return;
+        }
+
         if (fileData.type === 'image_generation') {
             msgEl.innerHTML = `
                 <div class="message-avatar">${avatarContent}</div>
@@ -637,7 +696,9 @@ async function sendMessage(text, isHidden = false) {
         const decoder = new TextDecoder();
         let buffer = '';
         let finalReply = '';
+        let streamingReply = '';
         let finalMsgType = 'text';
+        let streamingMsgEl = null;
         const toolCodes = []; // Collect tool calls for persistent display
 
         while (true) {
@@ -665,6 +726,19 @@ async function sendMessage(text, isHidden = false) {
                     } else if (event.type === 'tool_code') {
                         addToolCode(event.tool, event.code);
                         toolCodes.push({ tool: event.tool, code: event.code });
+                    } else if (event.type === 'chunk') {
+                        streamingReply += event.text;
+                        if (!streamingMsgEl) {
+                            streamingMsgEl = document.createElement('div');
+                            streamingMsgEl.className = 'message agent streaming';
+                            streamingMsgEl.innerHTML = `
+                                <div class="message-avatar">✦</div>
+                                <div class="message-content"></div>
+                            `;
+                            chatMessages.appendChild(streamingMsgEl);
+                        }
+                        streamingMsgEl.querySelector('.message-content').innerHTML = marked.parse(streamingReply);
+                        scrollToBottom();
                     } else if (event.type === 'final') {
                         finalReply = event.text;
                         finalMsgType = event.msg_type || 'text';
@@ -683,8 +757,11 @@ async function sendMessage(text, isHidden = false) {
 
         // Remove timeline and show final response
         removeActivityTimeline();
-        if (finalReply) {
-            appendMessage('agent', finalReply, finalMsgType);
+        if (streamingMsgEl) {
+            streamingMsgEl.remove();
+        }
+        if (finalReply || streamingReply) {
+            appendMessage('agent', finalReply || streamingReply, finalMsgType);
 
             // Append persistent Execution Log if tools were used
             if (toolCodes.length > 0) {
@@ -1326,9 +1403,54 @@ document.querySelectorAll('.welcome-card').forEach((card) => {
 });
 
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && mcqModal.classList.contains('active')) {
-        closeModal();
+    if (e.key === 'Escape') {
+        if (mcqModal.classList.contains('active')) closeModal();
+        if (confirmModalEl && confirmModalEl.classList.contains('active')) closeConfirmModal();
     }
+});
+
+// --- Confirm Modal Logic ---
+const confirmModalEl = document.getElementById('actionConfirmModal');
+const confirmIcon = document.getElementById('confirmIcon');
+const confirmTitle = document.getElementById('confirmTitle');
+const confirmDetails = document.getElementById('confirmDetails');
+const btnConfirmProceed = document.getElementById('btnConfirmProceed');
+const btnActionCancel = document.getElementById('btnActionCancel');
+
+let pendingConfirmData = null;
+
+function showNovelConfirmModal(data) {
+    pendingConfirmData = data;
+    confirmIcon.textContent = data.icon || '📖';
+    confirmTitle.textContent = data.title || 'ยืนยันการดำเนินการ';
+
+    let detailsHtml = '';
+    if (data.details && Array.isArray(data.details)) {
+        data.details.forEach(d => {
+            detailsHtml += `<div class="detail-row"><span class="detail-label">${escapeHtml(d.label)}</span><span class="detail-value">${escapeHtml(d.value)}</span></div>`;
+        });
+    }
+    confirmDetails.innerHTML = detailsHtml || '<p>ต้องการดำเนินการต่อหรือไม่?</p>';
+    confirmModalEl.classList.add('active');
+}
+
+function closeConfirmModal() {
+    confirmModalEl.classList.remove('active');
+    pendingConfirmData = null;
+}
+
+btnConfirmProceed.addEventListener('click', () => {
+    const data = pendingConfirmData;
+    closeConfirmModal();
+    const proceedMsg = data?.proceed_message || 'ยืนยันเริ่มสร้างหนังสือได้เลย';
+    sendMessage(proceedMsg);
+});
+
+btnActionCancel.addEventListener('click', () => {
+    const data = pendingConfirmData;
+    closeConfirmModal();
+    const cancelMsg = data?.cancel_message || 'ยกเลิกครับ';
+    sendMessage(cancelMsg);
 });
 
 // --- Initialize ---
@@ -1345,3 +1467,79 @@ document.addEventListener('keydown', (e) => {
         console.error("Failed to fetch profile", e);
     }
 })();
+
+// --- Novel Generation Polling ---
+function startNovelPolling(jobId, cardId) {
+    const interval = setInterval(async () => {
+        try {
+            const res = await fetch(`/api/novel-status/${jobId}`);
+            if (!res.ok) { clearInterval(interval); return; }
+            const data = await res.json();
+            const card = document.getElementById(cardId);
+            if (!card) { clearInterval(interval); return; }
+
+            const stepEl = card.querySelector('.novel-step');
+            const barEl = card.querySelector('.novel-bar');
+            const pctEl = card.querySelector('.novel-pct');
+
+            if (stepEl) stepEl.textContent = `⏳ ${data.current_step}`;
+            if (barEl) barEl.style.width = `${data.progress}%`;
+            if (pctEl) pctEl.textContent = `${data.progress}%`;
+
+            // Update title if AI generated a new one (replaces premise with short title)
+            if (data.title) {
+                const titleEl = card.querySelector('[data-novel-title]');
+                if (titleEl) titleEl.textContent = data.title;
+            }
+
+            if (data.status === 'done') {
+                clearInterval(interval);
+                const dl = data.download;
+                const pdfDl = data.pdf_download;
+
+                let downloadButtons = `
+                    <a href="/api/download/${encodeURIComponent(dl.filename)}" 
+                       download 
+                       style="display: inline-flex; align-items: center; gap: 8px; background: linear-gradient(135deg, #3b82f6, #2563eb); color: white; padding: 10px 20px; border-radius: 10px; text-decoration: none; font-weight: 600; transition: transform 0.2s, box-shadow 0.2s; font-size: 0.9em;"
+                       onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 6px 20px rgba(59,130,246,0.4)';"
+                       onmouseout="this.style.transform='none'; this.style.boxShadow='none';">
+                        📄 DOCX
+                    </a>`;
+
+                if (pdfDl && pdfDl.filename) {
+                    downloadButtons += `
+                    <a href="/api/download/${encodeURIComponent(pdfDl.filename)}" 
+                       download 
+                       style="display: inline-flex; align-items: center; gap: 8px; background: linear-gradient(135deg, #ef4444, #dc2626); color: white; padding: 10px 20px; border-radius: 10px; text-decoration: none; font-weight: 600; transition: transform 0.2s, box-shadow 0.2s; font-size: 0.9em;"
+                       onmouseover="this.style.transform='translateY(-2px)'; this.style.boxShadow='0 6px 20px rgba(239,68,68,0.4)';"
+                       onmouseout="this.style.transform='none'; this.style.boxShadow='none';">
+                        📕 PDF
+                    </a>`;
+                }
+
+                card.innerHTML = `
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px;">
+                        <span style="font-size: 1.5em;">✅</span>
+                        <div>
+                            <div style="font-weight: 600; color: var(--text-primary);">${escapeHtml(data.title)} — เสร็จสมบูรณ์!</div>
+                            <div style="font-size: 0.85em; color: var(--text-muted);">${data.chapters} บท</div>
+                        </div>
+                    </div>
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-bottom: 12px;">เลือกรูปแบบดาวน์โหลด:</div>
+                    <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                        ${downloadButtons}
+                    </div>
+                `;
+                card.style.borderColor = 'rgba(34,197,94,0.4)';
+                card.style.background = 'linear-gradient(135deg, rgba(34,197,94,0.15), rgba(59,130,246,0.1))';
+            } else if (data.status === 'error') {
+                clearInterval(interval);
+                if (stepEl) stepEl.textContent = `❌ ${data.error || 'เกิดข้อผิดพลาด'}`;
+                card.style.borderColor = 'rgba(239,68,68,0.4)';
+                card.style.background = 'linear-gradient(135deg, rgba(239,68,68,0.15), rgba(59,130,246,0.1))';
+            }
+        } catch (err) {
+            console.error('Novel poll error:', err);
+        }
+    }, 5000); // Poll every 5 seconds
+}

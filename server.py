@@ -6,11 +6,9 @@ Serves static frontend and provides /api endpoints to interact with the ADK agen
 import os
 import uuid
 import json
-import asyncio
 import re
 import csv
 import io
-import base64
 import logging
 import pathlib
 from contextlib import asynccontextmanager
@@ -26,7 +24,8 @@ from docx import Document as DocxDocument
 from openpyxl import load_workbook
 from google import genai
 from google.adk.agents import Agent
-from google.adk.runners import Runner
+from google.adk.runners import Runner, RunConfig
+from google.adk.agents.run_config import StreamingMode
 from google.adk.sessions import DatabaseSessionService
 from google.genai.types import Content, Part, Blob
 
@@ -40,7 +39,7 @@ logger = logging.getLogger(__name__)
 load_dotenv(os.path.join(os.path.dirname(__file__), "life_coach_agent", ".env"))
 
 # --- ADK Agent Setup ---
-from life_coach_agent.agent import root_agent
+from life_coach_agent.agent import root_agent, novel_jobs
 
 APP_NAME = "life_coach_app"
 USER_ID = "default_user"
@@ -61,7 +60,7 @@ runner = Runner(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize DB on startup."""
-    db.init_db()
+    await db.init_db()
     yield
 
 app = FastAPI(title="Life Coach Agent MVP", lifespan=lifespan)
@@ -100,7 +99,7 @@ class SessionCreate(BaseModel):
 async def api_create_session(body: SessionCreate):
     """Create a new chat session."""
     session_id = str(uuid.uuid4())
-    session_data = db.create_session(session_id, body.title)
+    session_data = await db.create_session(session_id, body.title)
     await session_service.create_session(
         app_name=APP_NAME,
         user_id=USER_ID,
@@ -112,30 +111,30 @@ async def api_create_session(body: SessionCreate):
 @app.get("/api/sessions")
 async def api_list_sessions():
     """List all chat sessions."""
-    return db.list_sessions()
+    return await db.list_sessions()
 
 
 @app.delete("/api/sessions/all")
 async def api_delete_all_sessions():
     """Delete all chat sessions."""
-    db.delete_all_sessions()
+    await db.delete_all_sessions()
     return {"status": "cleared"}
 
 
 @app.delete("/api/sessions/{session_id}")
 async def api_delete_session(session_id: str):
     """Delete a chat session."""
-    db.delete_session(session_id)
+    await db.delete_session(session_id)
     return {"status": "deleted"}
 
 
 @app.get("/api/export")
 async def api_export_data():
     """Export all user data as JSON."""
-    sessions = db.list_sessions()
+    sessions = await db.list_sessions()
     for s in sessions:
-        s['messages'] = db.get_session_messages(s['id'])
-    profile = db.get_user_profile()
+        s['messages'] = await db.get_session_messages(s['id'])
+    profile = await db.get_user_profile()
     
     return {
         "profile": profile,
@@ -146,18 +145,18 @@ async def api_export_data():
 @app.get("/api/sessions/{session_id}/messages")
 async def api_get_messages(session_id: str):
     """Get all messages for a session."""
-    return db.get_session_messages(session_id)
+    return await db.get_session_messages(session_id)
 
 @app.get("/api/profile")
 async def api_get_profile():
     """Get user profile."""
-    profile = db.get_user_profile()
+    profile = await db.get_user_profile()
     return {"profile": profile}
 
 @app.delete("/api/profile")
 async def api_delete_profile():
     """Clear user profile."""
-    db.clear_user_profile()
+    await db.clear_user_profile()
     if hasattr(app, "profile_summary_cache"):
         app.profile_summary_cache = None
     return {"status": "cleared"}
@@ -165,7 +164,7 @@ async def api_delete_profile():
 @app.get("/api/profile_summary")
 async def api_get_profile_summary():
     """Get an AI-generated summary of the user's profile."""
-    profile = db.get_user_profile()
+    profile = await db.get_user_profile()
     if not profile:
         return {"summary": "<p style='color: var(--text-muted); text-align: center;'>ยังไม่มีข้อมูลส่วนตัว<br>กรุณาเริ่มแชทเพื่อตอบแบบสอบถามเบื้องต้น</p>"}
     
@@ -220,6 +219,12 @@ TOOL_LABELS = {
     "create_docx_document": "📄 กำลังสร้างเอกสาร Word...",
     "create_xlsx_document": "📊 กำลังสร้างไฟล์ Excel...",
     "generate_mcq": "📝 กำลังสร้างคำถาม...",
+    "generate_novel": "📖 กำลังเริ่มสร้างนิยาย...",
+    "edit_chapter": "✏️ กำลังแก้ไขบท...",
+    "export_novel": "📦 กำลัง export นิยาย...",
+    "list_novels": "📚 กำลังดูรายการนิยาย...",
+    "execute_python_code": "🐍 กำลังรันโค้ด Python...",
+    "transfer_to_agent": "🔄 กำลังส่งต่อให้ผู้เชี่ยวชาญ...",
 }
 
 
@@ -228,6 +233,7 @@ def _classify_reply(agent_reply: str) -> tuple[str, str]:
     msg_type = "text"
     stripped = agent_reply.strip()
 
+    # Strip markdown code fences
     clean = stripped
     if clean.startswith("```json"):
         clean = clean[7:]
@@ -237,26 +243,35 @@ def _classify_reply(agent_reply: str) -> tuple[str, str]:
         clean = clean[:-3]
     clean = clean.strip()
 
+    FILE_TYPES = ("docx_download", "pdf_download", "xlsx_download", "image_generation", "confirm_action", "novel_in_progress", "novel_download")
+    MCQ_TYPES = ("mcq", "survey")
+
+    # Try direct JSON parse first (handles nested objects like confirm_action with details array)
+    if clean.startswith("{"):
+        try:
+            parsed = json.loads(clean)
+            if isinstance(parsed, dict) and "type" in parsed:
+                t = parsed["type"]
+                if t in MCQ_TYPES:
+                    return t, clean
+                elif t in FILE_TYPES:
+                    return "file", clean
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: regex for inline JSON embedded in text (flat objects only)
     json_match = re.search(
-        r'\{[^{}]*"type"\s*:\s*"(?:mcq|survey|docx_download|pdf_download|xlsx_download|image_generation)"[^{}]*\}',
+        r'\{[^{}]*"type"\s*:\s*"(?:' + "|".join(MCQ_TYPES + FILE_TYPES) + r')"[^{}]*\}',
         clean, re.DOTALL,
     )
-    if not json_match and (stripped.startswith("{") or stripped.startswith("```")):
-        json_match_text = clean
-    else:
-        json_match_text = json_match.group(0) if json_match else clean
-
-    if stripped.startswith("{") or stripped.startswith("```") or json_match:
+    if json_match:
         try:
-            parsed = json.loads(json_match_text)
-            if isinstance(parsed, dict) and parsed.get("type") in ("mcq", "survey"):
-                msg_type = parsed.get("type")
-                agent_reply = json_match_text
-            elif isinstance(parsed, dict) and parsed.get("type") in (
-                "docx_download", "pdf_download", "xlsx_download", "image_generation",
-            ):
-                msg_type = "file"
-                agent_reply = json_match_text
+            parsed = json.loads(json_match.group(0))
+            t = parsed.get("type", "")
+            if t in MCQ_TYPES:
+                return t, json_match.group(0)
+            elif t in FILE_TYPES:
+                return "file", json_match.group(0)
         except json.JSONDecodeError:
             pass
 
@@ -285,8 +300,7 @@ def _build_user_content(body: ChatRequest, agent_input: str):
                     os.remove(img_path)
                 except OSError:
                     pass
-
-    return Content(parts=parts)
+    return Content(role="user", parts=parts)
 
 
 async def _prepare_agent_input(body: ChatRequest) -> str:
@@ -296,11 +310,13 @@ async def _prepare_agent_input(body: ChatRequest) -> str:
 
     if user_message.startswith("[ตอบแบบสอบถาม]"):
         answer = user_message.replace("[ตอบแบบสอบถาม]", "").strip()
-        db.append_user_profile(answer)
+        await db.append_user_profile(answer)
 
-    agent_input = user_message
+    from datetime import datetime
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agent_input = f"[System Context: Current Local Time is {current_time}]\n{user_message}"
 
-    user_profile = db.get_user_profile()
+    user_profile = await db.get_user_profile()
     if user_profile:
         profile_text = ", ".join(user_profile)
         agent_input = f"[ข้อมูลอ้างอิงผู้ใช้ (จดจำไว้ตลอดการสนทนา): {profile_text}]\n\n{agent_input}"
@@ -318,7 +334,7 @@ async def _prepare_agent_input(body: ChatRequest) -> str:
     display_msg = user_message
     if body.file_context:
         display_msg = f"📎 {user_message}" if user_message.strip() else "📎 ส่งไฟล์แนบ"
-    db.add_message(session_id, "user", display_msg, "text")
+    await db.add_message(session_id, "user", display_msg, "text")
 
     # Ensure ADK session exists
     existing = await session_service.get_session(
@@ -339,7 +355,7 @@ def _sse(data: dict) -> str:
 
 # --- SSE Streaming Chat Endpoint ---
 @app.post("/api/chat/stream")
-async def api_chat_stream(body: ChatRequest):
+async def api_chat_stream(body: ChatRequest, request: Request):
     """Send a message and stream agent activity + response via SSE."""
     agent_input = await _prepare_agent_input(body)
     user_content = _build_user_content(body, agent_input)
@@ -347,98 +363,162 @@ async def api_chat_stream(body: ChatRequest):
 
     async def event_generator():
         agent_reply = ""
+        full_text_accumulated = ""
         call_counter = 0
+        processed_length = 0
+        is_thinking = False
+        buffer = ""
 
         # Initial thinking step
         yield _sse({"type": "step", "text": "🤔 กำลังคิดวิเคราะห์..."})
 
         try:
-            async for event in runner.run_async(
-                user_id=USER_ID,
-                session_id=session_id,
-                new_message=user_content,
+            # 1. Phase 1 Orchestrator Planning Loop
+            from life_coach_agent.orchestrator import orchestrator
+            run_adk_runner = False
+            tasks_list = []
+            
+            async for event_dict in orchestrator.execute_task_graph(
+                user_intent=agent_input,
+                session_id=session_id
             ):
-                # --- Tool Call Request ---
-                if event.get_function_calls():
-                    for fc in event.get_function_calls():
-                        call_counter += 1
-                        tool_name = fc.name
-                        label = TOOL_LABELS.get(tool_name, f"⚙️ กำลังใช้เครื่องมือ {tool_name}...")
-                        yield _sse({"type": "step", "text": label})
+                if await request.is_disconnected():
+                    logger.info(f"Client disconnected during SSE stream for session {session_id}")
+                    break
+                    
+                if event_dict.get("type") == "control" and event_dict.get("action") == "execute_runner":
+                    run_adk_runner = True
+                    tasks_list = event_dict.get("tasks", [])
+                    continue
+                    
+                yield _sse(event_dict)
 
-                        # Send tool code/args for inline display
-                        try:
-                            args_dict = dict(fc.args) if fc.args else {}
-                            truncated_args = {}
-                            for k, v in args_dict.items():
-                                if isinstance(v, str) and len(v) > 800:
-                                    truncated_args[k] = v[:800] + f"\n... (truncated, {len(v)} chars total)"
-                                elif isinstance(v, list) and len(v) > 10:
-                                    truncated_args[k] = v[:10]
+            if await request.is_disconnected():
+                return
+
+            # 2. Execution Layer (Executor Service wrapping ADK Runner)
+            if run_adk_runner:
+                execution_content = user_content
+                # Inject the plan into the prompt for the Executor
+                if tasks_list:
+                    task_str = "Task Plan from Planner:\n" + "\n".join(f"- {t['id']}: {t['description']}" for t in tasks_list)
+                    execution_content.parts.append(Part(text=f"\n\n[System Instructions for Execution]\n{task_str}\nPlease execute these tasks step by step and synthesize a final response."))
+
+                async for event in runner.run_async(
+                    user_id=USER_ID,
+                    session_id=session_id,
+                    new_message=execution_content,
+                    run_config=RunConfig(streaming_mode=StreamingMode.SSE)
+                ):
+                    if await request.is_disconnected():
+                        logger.info(f"Client disconnected during SSE stream for session {session_id}")
+                        break
+                    # --- Tool Call Request ---
+                    if event.get_function_calls():
+                        for fc in event.get_function_calls():
+                            call_counter += 1
+                            tool_name = fc.name
+                            label = TOOL_LABELS.get(tool_name, f"⚙️ กำลังใช้เครื่องมือ {tool_name}...")
+                            yield _sse({"type": "step", "text": label})
+
+                            # Send tool code/args for inline display
+                            try:
+                                args_dict = dict(fc.args) if fc.args else {}
+                                truncated_args = {}
+                                for k, v in args_dict.items():
+                                    if isinstance(v, str) and len(v) > 800:
+                                        truncated_args[k] = v[:800] + f"\n... (truncated, {len(v)} chars total)"
+                                    elif isinstance(v, list) and len(v) > 10:
+                                        truncated_args[k] = v[:10]
+                                    else:
+                                        truncated_args[k] = v
+                                code_display = json.dumps(
+                                    {"function": tool_name, "arguments": truncated_args},
+                                    ensure_ascii=False, indent=2,
+                                )
+                                yield _sse({
+                                    "type": "tool_code",
+                                    "tool": tool_name,
+                                    "code": code_display,
+                                    "call_id": call_counter,
+                                })
+                            except Exception:
+                                pass
+
+                    # --- Tool Response ---
+                    elif event.get_function_responses():
+                        for fr in event.get_function_responses():
+                            # Extract a preview of what the tool returned
+                            result_preview = ""
+                            try:
+                                resp = fr.response
+                                if isinstance(resp, dict):
+                                    result_preview = json.dumps(resp, ensure_ascii=False, indent=2)
                                 else:
-                                    truncated_args[k] = v
-                            code_display = json.dumps(
-                                {"function": tool_name, "arguments": truncated_args},
-                                ensure_ascii=False, indent=2,
-                            )
+                                    result_preview = str(resp) if resp else ""
+                                # Truncate long results
+                                if len(result_preview) > 1000:
+                                    result_preview = result_preview[:1000] + f"\n... (truncated, {len(result_preview)} chars)"
+                            except Exception:
+                                result_preview = "(ไม่สามารถแสดงผลลัพธ์ได้)"
+
+                            tool_name = fr.name if hasattr(fr, "name") else "tool"
                             yield _sse({
-                                "type": "tool_code",
+                                "type": "tool_result",
                                 "tool": tool_name,
-                                "code": code_display,
-                                "call_id": call_counter,
-                            })
-                        except Exception:
-                            pass
-
-                # --- Tool Response ---
-                elif event.get_function_responses():
-                    for fr in event.get_function_responses():
-                        # Extract a preview of what the tool returned
-                        result_preview = ""
-                        try:
-                            resp = fr.response
-                            if isinstance(resp, dict):
-                                result_preview = json.dumps(resp, ensure_ascii=False, indent=2)
-                            else:
-                                result_preview = str(resp) if resp else ""
-                            # Truncate long results
-                            if len(result_preview) > 1000:
-                                result_preview = result_preview[:1000] + f"\n... (truncated, {len(result_preview)} chars)"
-                        except Exception:
-                            result_preview = "(ไม่สามารถแสดงผลลัพธ์ได้)"
-
-                        tool_name = fr.name if hasattr(fr, "name") else "tool"
-                        yield _sse({
-                            "type": "tool_result",
-                            "tool": tool_name,
-                            "preview": result_preview,
-                        })
-
-                # --- Intermediate text (agent thinking) ---
-                elif not event.is_final_response() and event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            # This is the agent's intermediate reasoning
-                            yield _sse({
-                                "type": "thinking",
-                                "text": part.text,
+                                "preview": result_preview,
                             })
 
-                # --- Final Response ---
-                elif event.is_final_response():
+                    # --- Text chunks (agent thinking and normal text) ---
                     if event.content and event.content.parts:
-                        agent_reply = event.content.parts[0].text or ""
+                        for part in event.content.parts:
+                            if hasattr(part, "text") and part.text:
+                                full_text_accumulated = part.text
+                                new_text = full_text_accumulated[processed_length:]
+                                if new_text:
+                                    processed_length = len(full_text_accumulated)
+                                    for char in new_text:
+                                        buffer += char
+                                        if not is_thinking and "<think>" in buffer:
+                                            is_thinking = True
+                                            buffer = buffer.replace("<think>", "")
+                                        elif is_thinking and "</think>" in buffer:
+                                            is_thinking = False
+                                            parts = buffer.split("</think>")
+                                            if parts[0]:
+                                                yield _sse({"type": "thinking", "text": parts[0]})
+                                            buffer = parts[1] if len(parts) > 1 else ""
+                                            
+                                        if is_thinking and len(buffer) > 20:
+                                            chunk_to_emit = buffer[:-8]
+                                            buffer = buffer[-8:]
+                                            if chunk_to_emit:
+                                                yield _sse({"type": "thinking", "text": chunk_to_emit})
+                                        elif not is_thinking and len(buffer) > 20:
+                                            chunk_to_emit = buffer[:-8]
+                                            buffer = buffer[-8:]
+                                            if chunk_to_emit:
+                                                yield _sse({"type": "chunk", "text": chunk_to_emit})
+            
+            # Flush remaining buffer
+            if is_thinking and buffer:
+                yield _sse({"type": "thinking", "text": buffer})
+            elif not is_thinking and buffer:
+                yield _sse({"type": "chunk", "text": buffer})
+
+            # Clean final reply for database
+            agent_reply = re.sub(r'<think>.*?</think>', '', full_text_accumulated, flags=re.DOTALL).strip()
 
             # Classify and save
             msg_type, agent_reply = _classify_reply(agent_reply)
-            db.add_message(session_id, "agent", agent_reply, msg_type)
+            await db.add_message(session_id, "agent", agent_reply, msg_type)
 
             # Auto-title on first message
-            messages = db.get_session_messages(session_id)
+            messages = await db.get_session_messages(session_id)
             user_msgs = [m for m in messages if m["role"] == "user"]
             if len(user_msgs) == 1:
                 title = body.message[:40] + ("..." if len(body.message) > 40 else "")
-                db.update_session_title(session_id, title)
+                await db.update_session_title(session_id, title)
 
             # Send final response
             yield _sse({"type": "final", "text": agent_reply, "msg_type": msg_type})
@@ -475,13 +555,13 @@ async def api_chat(body: ChatRequest):
                 agent_reply = event.content.parts[0].text or ""
 
     msg_type, agent_reply = _classify_reply(agent_reply)
-    db.add_message(session_id, "agent", agent_reply, msg_type)
+    await db.add_message(session_id, "agent", agent_reply, msg_type)
 
-    messages = db.get_session_messages(session_id)
+    messages = await db.get_session_messages(session_id)
     user_msgs = [m for m in messages if m["role"] == "user"]
     if len(user_msgs) == 1:
         title = body.message[:40] + ("..." if len(body.message) > 40 else "")
-        db.update_session_title(session_id, title)
+        await db.update_session_title(session_id, title)
 
     return ChatResponse(
         session_id=session_id,
@@ -655,6 +735,49 @@ async def download_file(filename: str):
         filename=filename,
         media_type=media_type,
     )
+
+
+# --- Novel Status Polling ---
+@app.get("/api/novel-status/{job_id}")
+async def novel_status(job_id: str):
+    """Poll the status of a background novel generation job."""
+    job = novel_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    response = {
+        "status": job["status"],
+        "title": job.get("title", ""),
+        "chapters": job.get("chapters", 0),
+        "current_step": job.get("current_step", ""),
+        "progress": job.get("progress", 0),
+        "error": job.get("error", job.get("current_step", "") if job["status"] == "error" else ""),
+    }
+    
+    if job["status"] == "done":
+        filename = job.get("docx", "")
+        pdf_filename = job.get("pdf", "")
+        response["download"] = {
+            "type": "docx_download",
+            "file_id": str(uuid.uuid4()),
+            "filename": filename,
+            "title": job.get("title", ""),
+            "chapters": job.get("chapters", 0),
+            "message": f"สร้างนิยาย '{job.get('title', '')}' เรียบร้อยแล้ว! คลิกดาวน์โหลดได้เลยครับ 📖"
+        }
+        if pdf_filename:
+            response["pdf_download"] = {
+                "type": "pdf_download",
+                "file_id": str(uuid.uuid4()),
+                "filename": pdf_filename,
+                "title": job.get("title", ""),
+                "chapters": job.get("chapters", 0),
+                "message": f"สร้างนิยาย '{job.get('title', '')}' (PDF) เรียบร้อยแล้ว!"
+            }
+    elif job["status"] == "error":
+        response["error"] = job.get("error", "Unknown error")
+    
+    return response
 
 
 # --- Serve Frontend ---

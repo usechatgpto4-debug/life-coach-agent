@@ -1,101 +1,111 @@
+"""
+Life Coach Agent — Root Coordinator Agent
+Delegates novel tasks to NovelArchitect, document tasks to DocumentCreator.
+Handles coaching, web search, image generation directly.
+"""
+
 import os
-import uuid
 import json
-import re
 import logging
-import subprocess
-import sys
-import tempfile
-import traceback
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from duckduckgo_search import DDGS
 import requests
 from bs4 import BeautifulSoup
 import markdownify
 from google import genai
-
-from fpdf import FPDF
-
-from openpyxl import Workbook
-from openpyxl.styles import Font as XlFont, Alignment, PatternFill, Border, Side
+from datetime import datetime, timezone, timedelta
 
 from google.adk.agents import Agent
+
+# Sub-agents
+from life_coach_agent.novel_agent import novel_agent, novel_jobs
+from life_coach_agent.document_agent import document_agent
+
+logger = logging.getLogger(__name__)
 
 # Directory to store generated files
 EXPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "exports")
 os.makedirs(EXPORT_DIR, exist_ok=True)
 
-logger = logging.getLogger(__name__)
-
-# We will use fpdf2 for PDF generation, loading fonts directly inside the function
-_FONTS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fonts")
-_THAI_FONT_REGULAR = os.path.join(_FONTS_DIR, "Sarabun-Regular.ttf")
-_THAI_FONT_BOLD = os.path.join(_FONTS_DIR, "Sarabun-Bold.ttf")
+import uuid
 
 SYSTEM_INSTRUCTION = """คุณคือ "Life Coach AI" — ผู้ช่วยอัจฉริยะที่เชี่ยวชาญด้านการให้คำปรึกษา การเขียน และการสร้างเอกสาร
 
 [CRITICAL: LOGIC LENS & TRANSPARENCY]
 ก่อนที่คุณจะตัดสินใจหรือสร้างคำตอบใดๆ ให้คุณ "คิดออกมาดังๆ" เสมอ โดยการเขียนเหตุผลและลำดับความคิดอย่างเป็นขั้นตอน 
-ให้คุณวิเคราะห์คำขอของผู้ใช้ ค้นหาเครื่องมือที่จำเป็นต้องใช้ และอธิบายสิ่งที่คุณกำลังจะทำอย่างชัดเจน
-คุณจะต้องแสดงการคิดอย่างมีตรรกะทีละขั้น (Step-by-step reasoning)
+**คำสั่งบังคับ:** คุณต้องครอบชุดความคิดทั้งหมดด้วยแท็ก `<think> ... </think>` เสมอ ห้ามลืมเด็ดขาด
+ตัวอย่าง:
+<think>
+1. ผู้ใช้ต้องการ...
+2. ฉันจะใช้เครื่องมือ...
+3. ดังนั้นฉันจะตอบว่า...
+</think>
+คำตอบของคุณตรงนี้...
+
+เมื่อผู้ใช้ขอให้คุณตรวจสอบหรือวิเคราะห์โค้ด ให้คุณสวมบทบาท "Logic Lens" ซึ่งเป็นการตรวจสอบโค้ดเชิงลึกอย่างเป็นระบบ โดยตรวจสอบช่องโหว่ทางลอจิก ความปลอดภัย และข้อผิดพลาดตามหมวดหมู่ 9 ข้อ (Null/Undefined, Type Safety, Concurrency, Resource Management, Security Injection, Boundary Conditions, Algorithm Correctness, State Management, API Contracts) และแจ้งผลให้ผู้ใช้ทราบอย่างชัดเจน พร้อมแบ่งระดับความรุนแรง (CRITICAL, HIGH, MEDIUM, LOW)
 
 [CORE CAPABILITIES]
 1. การทำความรู้จักผู้ใช้ (Initial Profiling) - สร้างแบบสอบถาม (survey) เพื่อทำความรู้จักผู้ใช้
 2. การให้คำปรึกษา (Life Coaching) - ให้คำแนะนำที่ตรงจุด อบอุ่น เป็นกันเอง และมีเหตุผลรองรับ
-3. การส่งออกเอกสาร (Document Export) - สามารถสร้างไฟล์ docx, pdf, xlsx ให้ผู้ใช้ได้
+3. การค้นหาข้อมูล (Web Search) - [CRITICAL] คุณต้องใช้ tool `web_search` ทุกครั้งที่มีการอ้างอิงถึงข้อมูล ข่าวสาร เหตุการณ์ปัจจุบัน วันที่ หรือข้อมูลใดๆ ก็ตามที่อาจมีการเปลี่ยนแปลงตามกาลเวลา ห้ามตอบจากความรู้เดิม (Internal Knowledge) เด็ดขาด เพื่อให้ได้ข้อมูลที่ Real-time และแม่นยำที่สุด
+4. การสร้างภาพ (Image Generation) - สร้างภาพจากคำอธิบาย
+5. การรับรู้วันเวลาปัจจุบัน - คุณสามารถใช้ tool `get_current_datetime` เพื่อตรวจสอบวันที่ เวลา และวันในสัปดาห์ปัจจุบันได้ (สำคัญเวลาผู้ใช้ถามเกี่ยวกับวันนี้)
 
-[PDF GENERATION & PYTHON EXECUTION]
-คุณมีเครื่องมือ `execute_python_code` เพื่อรันโค้ด Python ได้
-- **สำคัญมาก:** เมื่อผู้ใช้ขอไฟล์ PDF หรือต้องการสร้าง PDF ที่มีเนื้อหาภาษาไทย ให้คุณเขียนโค้ด Python โดยใช้ไลบรารี `fpdf` และใช้เครื่องมือ `execute_python_code` เพื่อรันโค้ดและสร้างไฟล์ด้วยตัวเอง (อย่าใช้ create_pdf_document แบบเดิม เพราะอาจมีปัญหาฟอนต์ภาษาไทย)
-- ไฟล์ที่ถูกสร้างต้องถูกบันทึกลงในโฟลเดอร์ `exports` (Path: `./exports/`)
-- ฟอนต์ภาษาไทยอยู่ในโฟลเดอร์ `fonts` (Path: `./fonts/Sarabun-Regular.ttf` และ `./fonts/Sarabun-Bold.ttf`)
-- เมื่อสร้างไฟล์เสร็จเรียบร้อย ให้คุณตอบกลับผู้ใช้ด้วย JSON เพื่อให้ UI แสดงปุ่มดาวน์โหลด โดยมีรูปแบบดังนี้:
-```json
-{
-  "type": "pdf_download",
-  "filename": "ชื่อไฟล์ที่สร้าง.pdf",
-  "message": "สร้างเอกสาร PDF เสร็จเรียบร้อยแล้วครับ! 📄"
-}
-```
+[DELEGATION — Sub-Agents]
+คุณมี sub-agents 2 ตัว ที่จะจัดการงานเฉพาะทาง:
+
+1. **NovelArchitect** — สำหรับงานเกี่ยวกับนิยาย/หนังสือทุกอย่าง:
+   - สร้างนิยายใหม่
+   - แก้ไขบทในนิยายที่สร้างไว้
+   - Export นิยายเป็น DOCX/PDF
+   - ดูรายการนิยายที่มีอยู่
+   → เมื่อผู้ใช้พูดถึงนิยาย หนังสือ เรื่องสั้น การเขียน → delegate ให้ NovelArchitect
+
+2. **DocumentCreator** — สำหรับสร้างเอกสารทุกชนิด:
+   - สร้างไฟล์ Word (.docx)
+   - สร้างไฟล์ PDF
+   - สร้างไฟล์ Excel (.xlsx)
+   - รันโค้ด Python
+   → เมื่อผู้ใช้ต้องการสร้างเอกสาร ตาราง รายงาน → delegate ให้ DocumentCreator
 
 [JSON RESPONSE FORMATS]
-เมื่อคุณต้องการสร้างแบบฟอร์ม หรือปุ่มดาวน์โหลด ให้ตอบกลับด้วย JSON โครงสร้างเหล่านี้เท่านั้น (ห้ามพิมพ์ข้อความอื่นต่อท้ายหรือนำหน้า)
-- Survey: `{"type": "survey", "title": "...", "questions": [...]}`
-- MCQ: `{"type": "mcq", "question": "...", "options": [...], "correct_answer": "...", "explanation": "..."}`
-- Word: `{"type": "docx_download", ...}` (ใช้ tool create_docx_document)
-- Excel: `{"type": "xlsx_download", ...}` (ใช้ tool create_xlsx_document)
-- Image: `{"type": "image_generation", ...}` (ใช้ tool generate_image)
+เมื่อคุณต้องการสร้างแบบฟอร์ม ให้ตอบกลับด้วย JSON โครงสร้างเหล่านี้เท่านั้น:
+- Survey: {"type": "survey", "title": "...", "questions": [...]}
+- MCQ: {"type": "mcq", "question": "...", "options": [...], "correct_answer": "...", "explanation": "..."}
+- Image: {"type": "image_generation", ...} (ใช้ tool generate_image)
+
+[COACHING MODE — Socratic Method]
+เมื่อให้คำปรึกษาชีวิต ห้ามตอบด้วยคำแนะนำตรงๆ ให้ใช้วิธี Socratic:
+1. ถาม ไม่ใช่บอก — ถามคำถามที่ช่วยให้ผู้ใช้คิดเอง
+2. สร้างจากคำตอบของพวกเขา — อ้างอิงสิ่งที่พวกเขาพูด
+3. เผยความขัดแย้งเบาๆ — "คุณบอกว่า X แต่ก็บอกว่า Y..."
+4. นำไปสู่การค้นพบด้วยตนเอง — ให้พวกเขาถึงข้อสรุปเอง
+5. สรุปสิ่งที่พวกเขาค้นพบ — "สรุปคือคุณกำลังบอกว่า..."
+6. ห้ามใช้ภาษา therapeutic validation เช่น "ฉันเข้าใจความรู้สึกคุณ", "นั่นฟังดูยาก" — ให้ถามต่อแทน
+
+[RICH ELICITATION — การถามข้อมูล]
+เมื่อคำขอมีมากกว่า 2 มิติที่ต้องตัดสินใจ:
+1. ถาม 1-5 คำถามในรอบแรก เลือกคำถามที่ตัดทางเลือกเยอะที่สุด
+2. ให้ตัวเลือก multiple-choice เสมอ พร้อมแนะนำค่า default (ตัวหนา)
+3. ให้ทางลัด: "ตอบแบบย่อ เช่น 1ก 2ข 3ค หรือพิมพ์ 'defaults'"
+4. ห้ามเริ่มทำงานจนกว่าจะได้คำตอบที่จำเป็น
+
+[WRITING QUALITY — Anti-AI Prose Guard]
+เมื่อสร้างเนื้อหาเขียน (ทุกประเภท ไม่ใช่แค่นิยาย):
+- ห้ามใช้คำ: leverage, utilize, robust, seamless, cutting-edge, innovative, facilitate, streamline, navigate, pivotal
+- ห้ามใช้รูปแบบ: "At its core", "In a world where", "It's important to note", "Let's explore"
+- ห้ามใช้ transition filler: Moreover, Furthermore, Additionally
+- ห้ามใช้ hedging: "It's worth noting", "It should be noted"
+- ใช้ประโยคกระชับ คำกริยาทรงพลัง รายละเอียดเฉพาะเจาะจง
+- Show Don't Tell ในทุกบริบท
 
 [LANGUAGE & TONE]
 - ภาษาหลักคือภาษาไทย ให้พูดจาเป็นกันเอง อบอุ่น แต่มีความเป็นมืออาชีพ (ใช้คำว่า "ครับ/ค่ะ")
 - หากผู้ใช้พิมพ์ภาษาอื่น ให้ตอบกลับด้วยภาษานั้นๆ
 """
 
-# --- Helper: parse markdown-ish content into lines ---
-def _parse_content_lines(content: str):
-    """Parse content string into structured line tuples: (type, text)."""
-    lines = content.split('\n')
-    parsed = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            parsed.append(("blank", ""))
-        elif stripped.startswith('## '):
-            parsed.append(("h2", stripped[3:].strip()))
-        elif stripped.startswith('### '):
-            parsed.append(("h3", stripped[4:].strip()))
-        elif stripped.startswith('- ') or stripped.startswith('• '):
-            parsed.append(("bullet", stripped[2:].strip()))
-        elif re.match(r'^\d+\.\s', stripped):
-            text = re.sub(r'^\d+\.\s*', '', stripped)
-            parsed.append(("numbered", text))
-        else:
-            parsed.append(("text", stripped))
-    return parsed
 
+# ─── Tool: generate_mcq ────────────────────────────────────────────────────
 
 def generate_mcq(topic: str, difficulty: str = "medium") -> dict:
     """Generate a multiple choice question on a given topic.
@@ -115,162 +125,38 @@ def generate_mcq(topic: str, difficulty: str = "medium") -> dict:
     }
 
 
-def create_docx_document(title: str, content: str) -> dict:
-    """Create a .docx document file that the user can download.
+# ─── Tool: get_current_datetime ─────────────────────────────────────────────
 
-    Use this tool whenever the user asks to create a Word document or .docx file.
-
-    Args:
-        title: The document title (e.g., "คู่มือการสร้างหนังสือ", "แผนพัฒนาตนเอง")
-        content: The full document content. Use '\n' for line breaks and '## ' prefix for section headings.
-
+def get_current_datetime() -> dict:
+    """Get the current date and time (Timezone: Asia/Bangkok).
+    
     Returns:
-        dict: A JSON object with type "docx_download" containing the file_id and filename for download.
+        dict: A dictionary containing the current date, time, timezone, and day of week.
     """
-    doc = Document()
-
-    # --- Style the document ---
-    style = doc.styles['Normal']
-    font = style.font
-    font.name = 'TH Sarabun New'
-    font.size = Pt(14)
-
-    # Title
-    title_para = doc.add_heading(title, level=0)
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    doc.add_paragraph("")  # spacer
-
-    # Parse content into sections
-    for line_type, text in _parse_content_lines(content):
-        if line_type == "blank":
-            doc.add_paragraph("")
-        elif line_type == "h2":
-            doc.add_heading(text, level=2)
-        elif line_type == "h3":
-            doc.add_heading(text, level=3)
-        elif line_type == "bullet":
-            doc.add_paragraph(text, style='List Bullet')
-        elif line_type == "numbered":
-            doc.add_paragraph(text, style='List Number')
-        else:
-            doc.add_paragraph(text)
-
-    # Save file
-    file_id = str(uuid.uuid4())
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
-    filename = f"{safe_title}_{file_id[:8]}.docx"
-    filepath = os.path.join(EXPORT_DIR, filename)
-    doc.save(filepath)
-
-    result = {
-        "type": "docx_download",
-        "file_id": file_id,
-        "filename": filename,
-        "title": title,
-        "message": f"สร้างเอกสาร Word '{title}' เรียบร้อยแล้วครับ! คลิกปุ่มด้านล่างเพื่อดาวน์โหลด 📄"
-    }
-
-    return {"status": "success", "result": json.dumps(result, ensure_ascii=False)}
-
-
-def create_xlsx_document(title: str, headers_json: str, rows_json: str) -> dict:
-    """Create an .xlsx Excel spreadsheet file that the user can download.
-
-    Use this tool whenever the user asks to create an Excel file, spreadsheet,
-    table, checklist, or structured data export.
-
-    Args:
-        title: The spreadsheet title (e.g., "แผนการอ่าน 30 วัน", "Checklist พัฒนาตนเอง")
-        headers_json: JSON array string of column headers, e.g. '["หัวข้อ", "รายละเอียด", "สถานะ"]'
-        rows_json: JSON array of arrays string for row data, e.g. '[["อ่านหนังสือ", "30 นาที/วัน", "กำลังทำ"]]'
-
-    Returns:
-        dict: A JSON object with type "xlsx_download" containing the file_id and filename for download.
-    """
-    # Parse JSON string inputs
     try:
-        headers = json.loads(headers_json) if isinstance(headers_json, str) else headers_json
-    except (json.JSONDecodeError, TypeError):
-        headers = ["Column 1"]
+        # Create a timezone for Asia/Bangkok (UTC+7)
+        tz_bkk = timezone(timedelta(hours=7))
+        now = datetime.now(tz_bkk)
+        return {
+            "status": "success",
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "timezone": "Asia/Bangkok (UTC+7)",
+            "day_of_week": now.strftime("%A")
+        }
+    except Exception as e:
+        now = datetime.now()
+        return {
+            "status": "success",
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "timezone": "Local",
+            "day_of_week": now.strftime("%A"),
+            "note": str(e)
+        }
 
-    try:
-        rows = json.loads(rows_json) if isinstance(rows_json, str) else rows_json
-    except (json.JSONDecodeError, TypeError):
-        rows = []
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = title[:31]  # Excel sheet name max 31 chars
-
-    # --- Header styling ---
-    header_font = XlFont(name='Arial', size=12, bold=True, color='FFFFFF')
-    header_fill = PatternFill(start_color='6C3CE0', end_color='6C3CE0', fill_type='solid')
-    header_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    thin_border = Border(
-        left=Side(style='thin', color='D4D4D8'),
-        right=Side(style='thin', color='D4D4D8'),
-        top=Side(style='thin', color='D4D4D8'),
-        bottom=Side(style='thin', color='D4D4D8'),
-    )
-
-    # --- Write title row ---
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(len(headers), 1))
-    title_cell = ws.cell(row=1, column=1, value=title)
-    title_cell.font = XlFont(name='Arial', size=16, bold=True, color='1A1A2E')
-    title_cell.alignment = Alignment(horizontal='center', vertical='center')
-
-    # --- Write headers (row 3) ---
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=3, column=col_idx, value=str(header))
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = thin_border
-
-    # --- Write data rows ---
-    data_font = XlFont(name='Arial', size=11)
-    data_align = Alignment(vertical='center', wrap_text=True)
-    alt_fill = PatternFill(start_color='F5F3FF', end_color='F5F3FF', fill_type='solid')
-
-    for row_idx, row_data in enumerate(rows, 4):
-        if not isinstance(row_data, (list, tuple)):
-            row_data = [row_data]
-        for col_idx, value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=str(value))
-            cell.font = data_font
-            cell.alignment = data_align
-            cell.border = thin_border
-            if (row_idx - 4) % 2 == 1:
-                cell.fill = alt_fill
-
-    # --- Auto-fit column widths (approximate) ---
-    for col_idx in range(1, len(headers) + 1):
-        max_len = len(str(headers[col_idx - 1])) if col_idx <= len(headers) else 10
-        for row_data in rows:
-            if isinstance(row_data, (list, tuple)) and col_idx - 1 < len(row_data):
-                max_len = max(max_len, len(str(row_data[col_idx - 1])))
-        col_letter = chr(64 + col_idx) if col_idx <= 26 else 'A'
-        ws.column_dimensions[col_letter].width = min(max_len + 4, 50)
-
-    # --- Save ---
-    file_id = str(uuid.uuid4())
-    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
-    filename = f"{safe_title}_{file_id[:8]}.xlsx"
-    filepath = os.path.join(EXPORT_DIR, filename)
-    wb.save(filepath)
-
-    result = {
-        "type": "xlsx_download",
-        "file_id": file_id,
-        "filename": filename,
-        "title": title,
-        "row_count": len(rows),
-        "message": f"สร้างไฟล์ Excel '{title}' ({len(rows)} แถว) เรียบร้อยแล้วครับ! คลิกปุ่มด้านล่างเพื่อดาวน์โหลด 📊"
-    }
-
-    return {"status": "success", "result": json.dumps(result, ensure_ascii=False)}
-
+# ─── Tool: web_search ──────────────────────────────────────────────────────
 
 def web_search(query: str, max_results: int = 5) -> dict:
     """Perform a web search using DuckDuckGo to find information.
@@ -292,6 +178,8 @@ def web_search(query: str, max_results: int = 5) -> dict:
         logger.error("web_search failed for query '%s': %s", query, e, exc_info=True)
         return {"status": "error", "message": "ไม่สามารถค้นหาข้อมูลได้ในขณะนี้ กรุณาลองใหม่"}
 
+
+# ─── Tool: read_url ─────────────────────────────────────────────────────────
 
 def read_url(url: str) -> dict:
     """Extract and summarize content from a given URL.
@@ -324,6 +212,8 @@ def read_url(url: str) -> dict:
         logger.error("read_url failed for '%s': %s", url, e, exc_info=True)
         return {"status": "error", "message": "ไม่สามารถอ่านเนื้อหาจาก URL นี้ได้ กรุณาตรวจสอบลิงก์"}
 
+
+# ─── Tool: generate_image ──────────────────────────────────────────────────
 
 def generate_image(prompt: str) -> dict:
     """Generate an image using the Nano Banana Pro (Gemini 3 Pro Image Preview) model.
@@ -379,56 +269,13 @@ def generate_image(prompt: str) -> dict:
         return {"status": "error", "message": "ไม่สามารถสร้างภาพได้ในขณะนี้ กรุณาลองใหม่"}
 
 
-def execute_python_code(code: str) -> dict:
-    """Execute Python code and return the output.
-    
-    This is useful for generating custom files like PDF using fpdf, data analysis, 
-    or any task that requires executing dynamic Python scripts.
-    
-    Args:
-        code: The Python code to execute.
-        
-    Returns:
-        dict: A JSON object containing the execution status and output or error.
-    """
-    try:
-        # Create a temporary file to hold the code
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_file:
-            temp_file.write(code)
-            temp_file_path = temp_file.name
-            
-        # Execute the code
-        result = subprocess.run(
-            [sys.executable, temp_file_path],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-            cwd=os.path.dirname(os.path.dirname(__file__)) # Execute from the project root so ./exports and ./fonts paths work
-        )
-        
-        # Clean up
-        try:
-            os.remove(temp_file_path)
-        except:
-            pass
-            
-        if result.returncode == 0:
-            return {"status": "success", "output": result.stdout}
-        else:
-            return {"status": "error", "error": result.stderr, "output": result.stdout}
-            
-    except subprocess.TimeoutExpired:
-        return {"status": "error", "error": "Execution timed out after 30 seconds."}
-    except Exception as e:
-        logger.error("execute_python_code failed: %s", e, exc_info=True)
-        return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
-
+# ─── Root Agent Definition ──────────────────────────────────────────────────
 
 root_agent = Agent(
     name="life_coach_agent",
     model="gemini-3.1-pro-preview",
-    description="AI Life Coach that helps with writing, self-discovery, life guidance, web searching, URL reading, image generation, and creates downloadable documents (DOCX, PDF, XLSX).",
+    description="AI Life Coach ที่ให้คำปรึกษาชีวิต ค้นหาข้อมูล สร้างภาพ และ delegate งานเฉพาะทางให้ sub-agents",
     instruction=SYSTEM_INSTRUCTION,
-    tools=[generate_mcq, create_docx_document, create_xlsx_document, web_search, read_url, generate_image, execute_python_code],
+    tools=[generate_mcq, get_current_datetime, web_search, read_url, generate_image],
+    sub_agents=[novel_agent, document_agent],
 )
